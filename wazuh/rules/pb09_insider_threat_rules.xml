@@ -1,0 +1,60 @@
+<group name="insider_threat,privileged_access,ueba,anomaly,">
+
+  <!-- Rule 1: Privileged account accessing sensitive systems outside normal hours -->
+  <rule id="100080" level="12">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^4624$</field>
+    <field name="win.eventdata.targetUserName">admin|Administrator|svc_|sa_|backup</field>
+    <time>20:00 - 06:00</time>
+    <description>PB-09 | Privileged account login outside business hours — admin activity during off-hours window</description>
+    <group>insider_threat,privileged_access,off_hours,pb09,</group>
+  </rule>
+
+  <!-- Rule 2: Admin account accessing unusual number of systems in short window -->
+  <rule id="100081" level="13" frequency="10" timeframe="600">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^4624$</field>
+    <field name="win.eventdata.targetUserName">admin|Administrator</field>
+    <different_field>win.eventdata.workstationName</different_field>
+    <description>PB-09 | Privileged account lateral spread — admin authenticating to 10+ distinct hosts within 10 minutes</description>
+    <group>insider_threat,lateral_movement,privileged_access,pb09,</group>
+  </rule>
+
+  <!-- Rule 3: Sensitive directory or database bulk access -->
+  <rule id="100082" level="13" frequency="50" timeframe="300">
+    <if_matched_sid>554</if_matched_sid>
+    <field name="audit.type">READ|OPEN|LIST</field>
+    <field name="audit.file.path">\\Finance\\|\\HR\\|\\Legal\\|\\Executive\\|\\Confidential\\|\\PII\\|\\passwords\\|\\keys\\</field>
+    <same_field>audit.effective_user</same_field>
+    <description>PB-09 | Bulk access to sensitive directories — 50+ reads from restricted paths within 5 minutes</description>
+    <group>insider_threat,file_access,sensitive_data,pb09,</group>
+  </rule>
+
+  <!-- Rule 4: Group policy or AD object modification by non-standard account -->
+  <rule id="100083" level="14">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^5136$|^5137$|^5138$|^5141$</field>
+    <field name="win.eventdata.subjectUserName">!svc_gpo|!gpo_admin</field>
+    <description>PB-09 | Unauthorized AD/GPO modification — directory service object changed by non-standard account (EventID 5136/5137/5138/5141)</description>
+    <group>insider_threat,ad_modification,privileged_access,pb09,</group>
+  </rule>
+
+  <!-- Rule 5: Security log cleared or audit policy modified -->
+  <rule id="100084" level="15">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^1102$|^4719$|^4739$</field>
+    <description>PB-09 | Security audit log cleared or audit policy modified — insider covering tracks (EventID 1102/4719/4739)</description>
+    <group>insider_threat,log_tampering,defense_evasion,pb09,</group>
+  </rule>
+
+  <!-- Rule 6: New privileged account created outside change window -->
+  <rule id="100085" level="14">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^4720$|^4728$|^4732$</field>
+    <field name="win.eventdata.targetUserName">admin|svc_|backup|sa_</field>
+    <time>20:00 - 06:00</time>
+    <description>PB-09 | Privileged account created outside change window — new admin/service account created off-hours (EventID 4720/4728/4732)</description>
+    <group>insider_threat,account_creation,privileged_access,pb09,</group>
+  </rule>
+
+</group>

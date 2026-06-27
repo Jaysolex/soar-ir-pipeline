@@ -1,0 +1,428 @@
+{
+  "id": "pb08-c2-beaconing-block-v1",
+  "name": "PB-08 | C2 Beaconing Detection & Automated Outbound Block",
+  "description": "Production playbook. Ingests C2 beaconing indicators, LOLBin network connections, and suspicious outbound traffic patterns from Wazuh network monitoring. Enriches destination IPs and domains across VirusTotal, AbuseIPDB, Shodan, and MalwareBazaar URLhaus. Performs beacon interval analysis to distinguish true beaconing from legitimate periodic traffic. Routes to automated firewall block, EDR process kill, and host isolation for confirmed C2 channels.",
+  "tags": ["c2", "beaconing", "command-control", "network", "cobalt-strike", "pb08"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_c2_08",
+    "description": "Listens for Wazuh network anomaly and C2 behavioral alerts on rule group: c2,pb08 at level >= 12"
+  },
+  "variables": {
+    "VIRUSTOTAL_API_KEY": "{{ secrets.VIRUSTOTAL_API_KEY }}",
+    "ABUSEIPDB_API_KEY": "{{ secrets.ABUSEIPDB_API_KEY }}",
+    "SHODAN_API_KEY": "{{ secrets.SHODAN_API_KEY }}",
+    "CROWDSTRIKE_CLIENT_ID": "{{ secrets.CROWDSTRIKE_CLIENT_ID }}",
+    "CROWDSTRIKE_CLIENT_SECRET": "{{ secrets.CROWDSTRIKE_CLIENT_SECRET }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "SLACK_CRITICAL_CHANNEL": "{{ secrets.SLACK_CRITICAL_CHANNEL }}",
+    "FIREWALL_API_URL": "{{ secrets.FIREWALL_API_URL }}",
+    "FIREWALL_API_KEY": "{{ secrets.FIREWALL_API_KEY }}",
+    "WAZUH_API_URL": "{{ secrets.WAZUH_API_URL }}",
+    "WAZUH_API_TOKEN": "{{ secrets.WAZUH_API_TOKEN }}",
+    "THREAT_SCORE_THRESHOLD": 65,
+    "KNOWN_C2_PORTS": [4444, 8080, 8443, 9001, 9090, 1337, 31337, 50050, 60000],
+    "COBALT_STRIKE_AUTO_ISOLATE": true
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives Wazuh network flow, firewall, or process network connection alert payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "artifacts": {
+          "source_hostname": "string",
+          "source_ip": "string",
+          "agent_id": "string",
+          "destination_ip": "string",
+          "destination_domain": "string",
+          "destination_port": "integer",
+          "protocol": "string",
+          "direction": "string",
+          "bytes_sent": "integer",
+          "bytes_received": "integer",
+          "connection_count": "integer",
+          "interval_seconds": "array",
+          "process_name": "string",
+          "process_id": "string",
+          "parent_process": "string",
+          "beacon_jitter": "boolean",
+          "payload_size_variance": "float",
+          "username": "string",
+          "session_start": "string"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Beacon Pattern Pre-Analysis",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes network alert fields. Pre-flags known C2 ports and LOLBin processes for elevated scoring. Calculates interval consistency from the connection timestamp array to quantify beaconing regularity.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "source_hostname": "{{ $exec.artifacts.source_hostname }}",
+        "source_ip": "{{ $exec.artifacts.source_ip }}",
+        "agent_id": "{{ $exec.artifacts.agent_id }}",
+        "dest_ip": "{{ $exec.artifacts.destination_ip }}",
+        "dest_domain": "{{ $exec.artifacts.destination_domain }}",
+        "dest_port": "{{ $exec.artifacts.destination_port }}",
+        "protocol": "{{ $exec.artifacts.protocol }}",
+        "bytes_sent": "{{ $exec.artifacts.bytes_sent }}",
+        "bytes_received": "{{ $exec.artifacts.bytes_received }}",
+        "connection_count": "{{ $exec.artifacts.connection_count }}",
+        "interval_seconds": "{{ $exec.artifacts.interval_seconds }}",
+        "process_name": "{{ $exec.artifacts.process_name }}",
+        "process_id": "{{ $exec.artifacts.process_id }}",
+        "parent_process": "{{ $exec.artifacts.parent_process }}",
+        "username": "{{ $exec.artifacts.username }}",
+        "beacon_jitter": "{{ $exec.artifacts.beacon_jitter | default(false) }}",
+        "is_known_c2_port": "{{ variables.KNOWN_C2_PORTS | contains($exec.artifacts.destination_port) }}",
+        "is_lolbin": "{{ $exec.artifacts.process_name | contains('powershell') or $exec.artifacts.process_name | contains('cmd') or $exec.artifacts.process_name | contains('wscript') or $exec.artifacts.process_name | contains('mshta') or $exec.artifacts.process_name | contains('regsvr32') or $exec.artifacts.process_name | contains('rundll32') or $exec.artifacts.process_name | contains('certutil') or $exec.artifacts.process_name | contains('bitsadmin') }}",
+        "cobalt_strike_flag": "{{ $exec.rule_id == '100072' }}",
+        "interval_mean": "{{ $exec.artifacts.interval_seconds | average | round(2) }}",
+        "interval_stddev": "{{ $exec.artifacts.interval_seconds | stddev | round(2) }}",
+        "interval_consistency": "{{ ($exec.artifacts.interval_seconds | stddev) / ($exec.artifacts.interval_seconds | average) }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_cobalt_strike_gate",
+      "name": "Cobalt Strike Zero-Tolerance Gate",
+      "type": "condition",
+      "description": "Cobalt Strike beacon pattern (rule 100072) bypasses enrichment and triggers immediate isolation. CS is the most commonly used post-exploitation C2 framework — its presence is never benign in an enterprise environment.",
+      "condition": "{{ $node_02_extract.cobalt_strike_flag == true and variables.COBALT_STRIKE_AUTO_ISOLATE == true }}",
+      "true_branch": "node_10_isolate_host",
+      "false_branch": "node_04_vt_dest",
+      "depends_on": ["node_02_extract"]
+    },
+    {
+      "id": "node_04_vt_dest",
+      "name": "VirusTotal — Destination IP & Domain Reputation",
+      "type": "action",
+      "app": "VirusTotal",
+      "action": "get_ip_report",
+      "description": "Checks destination IP against VirusTotal. C2 infrastructure commonly shows up in VT with tags like 'c2', 'cobalt-strike', 'metasploit', 'malware-distribution'. Also queries for the domain if available.",
+      "input": {
+        "apikey": "{{ variables.VIRUSTOTAL_API_KEY }}",
+        "id": "{{ $node_02_extract.dest_ip }}"
+      },
+      "output_variables": {
+        "vt_malicious_count": "{{ $result.data.attributes.last_analysis_stats.malicious }}",
+        "vt_suspicious_count": "{{ $result.data.attributes.last_analysis_stats.suspicious }}",
+        "vt_total_engines": "{{ $result.data.attributes.last_analysis_stats.total }}",
+        "vt_tags": "{{ $result.data.attributes.tags }}",
+        "vt_categories": "{{ $result.data.attributes.categories }}",
+        "vt_is_c2": "{{ $result.data.attributes.tags | contains('c2') or $result.data.attributes.tags | contains('cobalt-strike') or $result.data.attributes.tags | contains('metasploit') or $result.data.attributes.tags | contains('empire') }}",
+        "vt_country": "{{ $result.data.attributes.country }}",
+        "vt_asn": "{{ $result.data.attributes.as_owner }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_abuseipdb",
+      "name": "AbuseIPDB — Destination IP Confidence Score",
+      "type": "action",
+      "app": "AbuseIPDB",
+      "action": "check_ip",
+      "description": "Validates destination IP against AbuseIPDB. C2 servers frequently get reported for port scanning, brute force, and malware distribution — high confidence score on the destination confirms malicious infrastructure.",
+      "input": {
+        "apikey": "{{ variables.ABUSEIPDB_API_KEY }}",
+        "ipAddress": "{{ $node_02_extract.dest_ip }}",
+        "maxAgeInDays": 30
+      },
+      "output_variables": {
+        "abuse_score": "{{ $result.data.abuseConfidenceScore }}",
+        "abuse_country": "{{ $result.data.countryCode }}",
+        "abuse_isp": "{{ $result.data.isp }}",
+        "abuse_usage_type": "{{ $result.data.usageType }}",
+        "abuse_total_reports": "{{ $result.data.totalReports }}",
+        "abuse_is_tor": "{{ $result.data.isTor }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_shodan",
+      "name": "Shodan — C2 Infrastructure Fingerprint",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Shodan for the destination IP. Returns open ports, running services, SSL certificate data, and Shodan tags. C2 servers often have unusual port combinations (50050 for Cobalt Strike team server), self-signed certificates, and Shodan tags like 'c2' or 'cobalt-strike'. SSL certificate subject can fingerprint C2 framework.",
+      "input": {
+        "method": "GET",
+        "url": "https://api.shodan.io/shodan/host/{{ $node_02_extract.dest_ip }}",
+        "params": {
+          "key": "{{ variables.SHODAN_API_KEY }}"
+        }
+      },
+      "output_variables": {
+        "shodan_org": "{{ $result.org }}",
+        "shodan_country": "{{ $result.country_code }}",
+        "shodan_open_ports": "{{ $result.ports }}",
+        "shodan_tags": "{{ $result.tags }}",
+        "shodan_hostnames": "{{ $result.hostnames }}",
+        "shodan_ssl_subject": "{{ $result.data | filter(d => d.ssl != null) | first | get('ssl.cert.subject.CN') }}",
+        "shodan_is_c2": "{{ $result.tags | contains('c2') or $result.tags | contains('cobalt-strike') or $result.ports | contains(50050) or $result.ports | contains(4444) or $result.ports | contains(31337) }}",
+        "shodan_last_update": "{{ $result.last_update }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_07_urlhaus",
+      "name": "URLhaus — C2 URL & Domain Intelligence",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Abuse.ch URLhaus for the destination IP or domain. URLhaus tracks malware distribution URLs, C2 infrastructure, and payload delivery URLs — a match here confirms active malware campaign use.",
+      "input": {
+        "method": "POST",
+        "url": "https://urlhaus-api.abuse.ch/v1/host/",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "host={{ $node_02_extract.dest_domain | default($node_02_extract.dest_ip) }}"
+      },
+      "output_variables": {
+        "urlhaus_status": "{{ $result.query_status }}",
+        "urlhaus_blacklists": "{{ $result.blacklists }}",
+        "urlhaus_url_count": "{{ $result.urls | length }}",
+        "urlhaus_malware_tags": "{{ $result.urls | map('tags') | flatten | unique }}",
+        "urlhaus_is_known_c2": "{{ $result.query_status == 'is_host' }}",
+        "urlhaus_threat": "{{ $result.urls[0].threat }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_08_beacon_analysis",
+      "name": "Beacon Interval Statistical Analysis",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Applies statistical analysis to the connection interval array. True beaconing has low coefficient of variation (< 0.3) — consistent intervals. Jitter-based beaconing (Cobalt Strike sleep + jitter) has moderate variance. Legitimate periodic traffic (NTP, WSUS) has very low variance but predictable intervals. Distinguishes true C2 from false positives.",
+      "input": {
+        "formula": {
+          "coefficient_of_variation": "{{ $node_02_extract.interval_stddev / $node_02_extract.interval_mean }}",
+          "is_consistent_beacon": "{{ ($node_02_extract.interval_stddev / $node_02_extract.interval_mean) < 0.3 }}",
+          "is_jitter_beacon": "{{ ($node_02_extract.interval_stddev / $node_02_extract.interval_mean) >= 0.1 and ($node_02_extract.interval_stddev / $node_02_extract.interval_mean) < 0.5 }}",
+          "beacon_type": "{{ ($node_02_extract.interval_stddev / $node_02_extract.interval_mean) < 0.1 ? 'CONSISTENT_BEACON' : ($node_02_extract.interval_stddev / $node_02_extract.interval_mean) < 0.5 ? 'JITTER_BEACON' : 'IRREGULAR' }}"
+        }
+      },
+      "output_variables": {
+        "coeff_variation": "{{ $result.coefficient_of_variation | round(3) }}",
+        "is_consistent_beacon": "{{ $result.is_consistent_beacon }}",
+        "is_jitter_beacon": "{{ $result.is_jitter_beacon }}",
+        "beacon_type": "{{ $result.beacon_type }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate"],
+      "branch": "false"
+    },
+    {
+      "id": "node_09_score",
+      "name": "Composite C2 Threat Score Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Aggregates all enrichment signals into a C2 confidence score. URLhaus and Shodan C2 tags are high-weight signals because they specifically track C2 infrastructure. Beacon interval analysis adds confidence when statistical pattern matches known C2 behavior.",
+      "input": {
+        "formula": "({{ $node_04_vt_dest.vt_malicious_count }} >= 5 ? 25 : {{ $node_04_vt_dest.vt_malicious_count }} >= 1 ? 15 : 0) + ({{ $node_04_vt_dest.vt_is_c2 }} == true ? 20 : 0) + ({{ $node_05_abuseipdb.abuse_score }} * 0.2) + ({{ $node_06_shodan.shodan_is_c2 }} == true ? 20 : 0) + ({{ $node_07_urlhaus.urlhaus_is_known_c2 }} == true ? 20 : 0) + ({{ $node_08_beacon_analysis.beacon_type }} == 'CONSISTENT_BEACON' ? 15 : {{ $node_08_beacon_analysis.beacon_type }} == 'JITTER_BEACON' ? 10 : 0) + ({{ $node_02_extract.is_known_c2_port }} == true ? 10 : 0) + ({{ $node_02_extract.is_lolbin }} == true ? 10 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_04_vt_dest", "node_05_abuseipdb", "node_06_shodan", "node_07_urlhaus", "node_08_beacon_analysis"]
+    },
+    {
+      "id": "node_09b_decision",
+      "name": "C2 Confidence Decision Gate",
+      "type": "condition",
+      "description": "Routes to automated block and process kill if score >= 65. Low-confidence beaconing (consistent interval but clean destination) routes to analyst review — could be legitimate monitoring agent or heartbeat.",
+      "condition": "{{ $node_09_score.composite_score >= variables.THREAT_SCORE_THRESHOLD }}",
+      "true_branch": "node_10_isolate_host",
+      "false_branch": "node_13_escalate",
+      "depends_on": ["node_09_score"]
+    },
+    {
+      "id": "node_10_isolate_host",
+      "name": "CrowdStrike Falcon — Isolate Host",
+      "type": "action",
+      "app": "CrowdStrike Falcon",
+      "action": "contain_host",
+      "description": "Network-isolates the infected endpoint via CrowdStrike Falcon. Severs the C2 channel immediately while preserving the EDR agent connection for forensic memory collection and process tree analysis.",
+      "input": {
+        "client_id": "{{ variables.CROWDSTRIKE_CLIENT_ID }}",
+        "client_secret": "{{ variables.CROWDSTRIKE_CLIENT_SECRET }}",
+        "ids": ["{{ $node_02_extract.agent_id }}"],
+        "action_parameters": [{ "name": "action_name", "value": "contain" }],
+        "comment": "PB-08 | C2 channel isolation. Score: {{ $node_09_score.composite_score }}. Dest: {{ $node_02_extract.dest_ip }}:{{ $node_02_extract.dest_port }}. Process: {{ $node_02_extract.process_name }}"
+      },
+      "output_variables": {
+        "isolation_status": "{{ $result.resources[0].status }}",
+        "device_id": "{{ $result.resources[0].device_id }}"
+      },
+      "depends_on": ["node_03_cobalt_strike_gate", "node_09b_decision"]
+    },
+    {
+      "id": "node_11_kill_process",
+      "name": "CrowdStrike RTR — Kill C2 Process",
+      "type": "action",
+      "app": "CrowdStrike Falcon",
+      "action": "run_rtr_command",
+      "description": "Uses CrowdStrike Real-Time Response to kill the beaconing process on the host before network isolation completes. Stopping the process terminates the C2 channel and prevents any in-flight commands from executing.",
+      "input": {
+        "client_id": "{{ variables.CROWDSTRIKE_CLIENT_ID }}",
+        "client_secret": "{{ variables.CROWDSTRIKE_CLIENT_SECRET }}",
+        "device_id": "{{ $node_10_isolate_host.device_id }}",
+        "command": "kill",
+        "command_string": "kill {{ $node_02_extract.process_id }}",
+        "base_command": "kill"
+      },
+      "output_variables": {
+        "process_kill_status": "{{ $result.resources[0].stdout }}"
+      },
+      "depends_on": ["node_10_isolate_host"],
+      "parallel_group": "post_isolation"
+    },
+    {
+      "id": "node_12_block_c2",
+      "name": "Firewall — Block C2 Destination (All Hosts)",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Pushes C2 destination IP and domain to the perimeter firewall blocklist. Applies to ALL hosts on the network — not just the infected endpoint. If other machines are beaconing to the same C2 server and haven't been detected yet, they get blocked preemptively.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.FIREWALL_API_URL }}/api/v1/blocklist",
+        "headers": {
+          "Authorization": "Bearer {{ variables.FIREWALL_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "indicators": [
+            {
+              "type": "ip",
+              "value": "{{ $node_02_extract.dest_ip }}",
+              "reason": "PB-08 C2 server — score: {{ $node_09_score.composite_score }}. VT: {{ $node_04_vt_dest.vt_malicious_count }} detections. Shodan C2: {{ $node_06_shodan.shodan_is_c2 }}",
+              "ttl_days": 90,
+              "apply_to_all": true
+            },
+            {
+              "type": "domain",
+              "value": "{{ $node_02_extract.dest_domain }}",
+              "reason": "PB-08 C2 domain — URLhaus: {{ $node_07_urlhaus.urlhaus_is_known_c2 }}",
+              "ttl_days": 90,
+              "apply_to_all": true
+            }
+          ]
+        }
+      },
+      "output_variables": {
+        "block_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_10_isolate_host"],
+      "parallel_group": "post_isolation"
+    },
+    {
+      "id": "node_13_escalate",
+      "name": "TheHive — Create C2 Incident Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a structured TheHive incident case with full C2 enrichment, beacon analysis, process context, and IR investigation checklist. C2 detection always creates a TheHive case regardless of branch — active implant on a network endpoint is always an incident.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-08 | C2 Beaconing — {{ $node_02_extract.source_hostname }} → {{ $node_02_extract.dest_ip }}:{{ $node_02_extract.dest_port }} | {{ $node_02_extract.process_name }} | Score: {{ $node_09_score.composite_score }}",
+        "severity": "{{ $node_02_extract.cobalt_strike_flag == true ? 4 : $node_09_score.composite_score >= 80 ? 3 : 2 }}",
+        "tags": ["c2", "pb08", "beaconing", "{{ $node_08_beacon_analysis.beacon_type | lower }}", "{{ $node_02_extract.is_lolbin == true ? 'lolbin' : 'process-c2' }}", "{{ $node_02_extract.cobalt_strike_flag == true ? 'cobalt-strike' : '' }}"],
+        "description": "## C2 Beaconing — Automated Detection Output\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule:** {{ $exec.rule_name }}\n**C2 Confidence Score:** {{ $node_09_score.composite_score }} / 100\n**Auto-Contained:** {{ $node_09b_decision.result }}\n\n### Beacon Characteristics\n| Field | Value |\n|---|---|\n| Source Host | {{ $node_02_extract.source_hostname }} |\n| Source IP | {{ $node_02_extract.source_ip }} |\n| Destination IP | {{ $node_02_extract.dest_ip }} |\n| Destination Domain | {{ $node_02_extract.dest_domain }} |\n| Destination Port | {{ $node_02_extract.dest_port }} |\n| Protocol | {{ $node_02_extract.protocol }} |\n| Connection Count | {{ $node_02_extract.connection_count }} |\n| Bytes Sent | {{ $node_02_extract.bytes_sent }} |\n| Bytes Received | {{ $node_02_extract.bytes_received }} |\n| Beacon Type | {{ $node_08_beacon_analysis.beacon_type }} |\n| Interval Mean (sec) | {{ $node_02_extract.interval_mean }} |\n| Interval StdDev | {{ $node_02_extract.interval_stddev }} |\n| Coefficient of Variation | {{ $node_08_beacon_analysis.coeff_variation }} |\n| Known C2 Port | {{ $node_02_extract.is_known_c2_port }} |\n| Cobalt Strike Flag | {{ $node_02_extract.cobalt_strike_flag }} |\n\n### Process Context\n| Field | Value |\n|---|---|\n| Process Name | {{ $node_02_extract.process_name }} |\n| Process ID | {{ $node_02_extract.process_id }} |\n| Parent Process | {{ $node_02_extract.parent_process }} |\n| Username | {{ $node_02_extract.username }} |\n| LOLBin | {{ $node_02_extract.is_lolbin }} |\n\n### Destination Intelligence\n| Source | Finding |\n|---|---|\n| VirusTotal | {{ $node_04_vt_dest.vt_malicious_count }}/{{ $node_04_vt_dest.vt_total_engines }} · Tags: {{ $node_04_vt_dest.vt_tags | join(', ') }} · C2 Tagged: {{ $node_04_vt_dest.vt_is_c2 }} |\n| AbuseIPDB | Score: {{ $node_05_abuseipdb.abuse_score }} · ISP: {{ $node_05_abuseipdb.abuse_isp }} · Country: {{ $node_05_abuseipdb.abuse_country }} · Tor: {{ $node_05_abuseipdb.abuse_is_tor }} |\n| Shodan | Org: {{ $node_06_shodan.shodan_org }} · Open Ports: {{ $node_06_shodan.shodan_open_ports | join(', ') }} · C2 Tagged: {{ $node_06_shodan.shodan_is_c2 }} · SSL CN: {{ $node_06_shodan.shodan_ssl_subject }} |\n| URLhaus | Known C2: {{ $node_07_urlhaus.urlhaus_is_known_c2 }} · Threat: {{ $node_07_urlhaus.urlhaus_threat }} · Malware Tags: {{ $node_07_urlhaus.urlhaus_malware_tags | join(', ') }} |\n\n### Containment Actions\n| Action | Status |\n|---|---|\n| CrowdStrike Host Isolation | {{ $node_10_isolate_host.isolation_status }} |\n| CrowdStrike RTR Process Kill | {{ $node_11_kill_process.process_kill_status }} |\n| Firewall C2 Block (90-day, all hosts) | {{ $node_12_block_c2.block_status }} |\n\n### IR Investigation Checklist\n- [ ] Pull full process tree from CrowdStrike — identify how the implant was delivered\n- [ ] Check parent process for initial access vector (Office macro, browser exploit, phishing attachment)\n- [ ] Collect memory dump of infected host before reimage\n- [ ] Search all other hosts for the same C2 destination IP and process name\n- [ ] Review DNS logs — check if other hosts resolved the C2 domain before the block\n- [ ] Check for persistence mechanisms — registry run keys, scheduled tasks, WMI subscriptions\n- [ ] Review lateral movement indicators — did the implant pivot to other hosts?\n- [ ] Identify what data was sent over the C2 channel (bytes_sent volume)\n- [ ] Check for additional implants — attackers often stage multiple C2 channels\n- [ ] Determine attacker dwell time — when was the first beacon connection?",
+        "observables": [
+          { "dataType": "ip", "data": "{{ $node_02_extract.dest_ip }}", "message": "C2 server IP" },
+          { "dataType": "domain", "data": "{{ $node_02_extract.dest_domain }}", "message": "C2 domain" },
+          { "dataType": "hostname", "data": "{{ $node_02_extract.source_hostname }}", "message": "Infected endpoint" },
+          { "dataType": "process", "data": "{{ $node_02_extract.process_name }}", "message": "C2 beaconing process" },
+          { "dataType": "other", "data": "Port {{ $node_02_extract.dest_port }} — {{ $node_08_beacon_analysis.beacon_type }}", "message": "C2 channel characteristics" }
+        ]
+      },
+      "depends_on": ["node_09b_decision", "node_11_kill_process", "node_12_block_c2"]
+    },
+    {
+      "id": "node_14_notify",
+      "name": "Slack — C2 Critical Alert",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts to both the SOC channel and the critical incidents channel. Active C2 channel means an attacker has interactive access to an endpoint — always a P1 severity event.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "channel": "{{ variables.SLACK_CRITICAL_CHANNEL }}",
+          "text": "*PB-08 | C2 BEACONING DETECTED{{ $node_02_extract.cobalt_strike_flag == true ? ' — :rotating_light: COBALT STRIKE SIGNATURE' : '' }}*",
+          "attachments": [
+            {
+              "color": "#E24B4A",
+              "fields": [
+                { "title": "C2 Score", "value": "{{ $node_09_score.composite_score }} / 100", "short": true },
+                { "title": "Action", "value": "{{ $node_09b_decision.result == true ? 'HOST ISOLATED + PROCESS KILLED + C2 BLOCKED' : 'ESCALATED TO ANALYST' }}", "short": true },
+                { "title": "Infected Host", "value": "{{ $node_02_extract.source_hostname }}", "short": true },
+                { "title": "C2 Destination", "value": "{{ $node_02_extract.dest_ip }}:{{ $node_02_extract.dest_port }}", "short": true },
+                { "title": "C2 Domain", "value": "{{ $node_02_extract.dest_domain | default('None') }}", "short": true },
+                { "title": "Beacon Type", "value": "{{ $node_08_beacon_analysis.beacon_type }}", "short": true },
+                { "title": "Process", "value": "{{ $node_02_extract.process_name }} (PID {{ $node_02_extract.process_id }})", "short": true },
+                { "title": "LOLBin", "value": "{{ $node_02_extract.is_lolbin }}", "short": true },
+                { "title": "VT Detections", "value": "{{ $node_04_vt_dest.vt_malicious_count }}/{{ $node_04_vt_dest.vt_total_engines }}", "short": true },
+                { "title": "Shodan C2 Tagged", "value": "{{ $node_06_shodan.shodan_is_c2 }}", "short": true },
+                { "title": "URLhaus Known C2", "value": "{{ $node_07_urlhaus.urlhaus_is_known_c2 }}", "short": true },
+                { "title": "Cobalt Strike", "value": "{{ $node_02_extract.cobalt_strike_flag }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_13_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_13_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    "node_03_cobalt_strike_gate",
+    ["node_04_vt_dest", "node_05_abuseipdb", "node_06_shodan", "node_07_urlhaus", "node_08_beacon_analysis"],
+    "node_09_score",
+    "node_09b_decision",
+    "node_10_isolate_host",
+    ["node_11_kill_process", "node_12_block_c2"],
+    "node_13_escalate",
+    "node_14_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Command and Control", "technique": "T1071", "subtechnique": "T1071.001", "name": "Application Layer Protocol: Web Protocols" },
+    { "tactic": "Command and Control", "technique": "T1071", "subtechnique": "T1071.004", "name": "Application Layer Protocol: DNS" },
+    { "tactic": "Command and Control", "technique": "T1573", "subtechnique": "T1573.002", "name": "Encrypted Channel: Asymmetric Cryptography" },
+    { "tactic": "Command and Control", "technique": "T1105", "name": "Ingress Tool Transfer" },
+    { "tactic": "Command and Control", "technique": "T1568", "name": "Dynamic Resolution" },
+    { "tactic": "Defense Evasion", "technique": "T1218", "name": "System Binary Proxy Execution (LOLBins)" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time beacon detection vs. manual log review",
+    "estimated_mttr_reduction": "C2 channel severed in < 5 seconds for Cobalt Strike zero-tolerance path",
+    "key_differentiator": "Four parallel C2 intel sources — VT, AbuseIPDB, Shodan port fingerprinting, URLhaus — plus statistical beacon interval analysis"
+  }
+}

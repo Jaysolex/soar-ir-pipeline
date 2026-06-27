@@ -1,0 +1,342 @@
+{
+  "id": "pb03-ransomware-isolation-v1",
+  "name": "PB-03 | Ransomware Detection & Host Isolation",
+  "description": "Production playbook. Ingests ransomware behavioral indicators from Wazuh FIM and process monitoring. Enriches file hashes via VirusTotal and Hybrid Analysis sandbox. Performs blast radius assessment across network shares. Routes to immediate EDR host isolation and AD credential reset, or analyst escalation for lower-confidence signals.",
+  "tags": ["ransomware", "host-isolation", "edr", "endpoint", "pb03"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_ransomware_03",
+    "description": "Listens for Wazuh FIM and process alerts on rule group: ransomware,pb03 at level >= 12"
+  },
+  "variables": {
+    "VIRUSTOTAL_API_KEY": "{{ secrets.VIRUSTOTAL_API_KEY }}",
+    "HYBRID_ANALYSIS_API_KEY": "{{ secrets.HYBRID_ANALYSIS_API_KEY }}",
+    "CROWDSTRIKE_CLIENT_ID": "{{ secrets.CROWDSTRIKE_CLIENT_ID }}",
+    "CROWDSTRIKE_CLIENT_SECRET": "{{ secrets.CROWDSTRIKE_CLIENT_SECRET }}",
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "SLACK_CRITICAL_CHANNEL": "{{ secrets.SLACK_CRITICAL_CHANNEL }}",
+    "THREAT_SCORE_THRESHOLD": 65,
+    "SHADOW_COPY_DELETE_AUTO_ISOLATE": true
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives Wazuh ransomware behavioral alert payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "severity": "string",
+        "artifacts": {
+          "hostname": "string",
+          "agent_id": "string",
+          "file_path": "string",
+          "file_hash_sha256": "string",
+          "process_name": "string",
+          "process_id": "string",
+          "parent_process": "string",
+          "username": "string",
+          "command_line": "string",
+          "rule_id": "string",
+          "file_rename_count": "integer",
+          "shadow_copy_deleted": "boolean",
+          "network_shares_accessed": "array"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Normalization",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes Wazuh alert fields. Flags immediate isolation triggers: shadow copy deletion and known ransomware binary names are zero-tolerance — no score threshold required.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "hostname": "{{ $exec.artifacts.hostname }}",
+        "agent_id": "{{ $exec.artifacts.agent_id }}",
+        "file_hash": "{{ $exec.artifacts.file_hash_sha256 }}",
+        "process_name": "{{ $exec.artifacts.process_name }}",
+        "process_id": "{{ $exec.artifacts.process_id }}",
+        "username": "{{ $exec.artifacts.username }}",
+        "command_line": "{{ $exec.artifacts.command_line }}",
+        "file_rename_count": "{{ $exec.artifacts.file_rename_count }}",
+        "shadow_copy_deleted": "{{ $exec.artifacts.shadow_copy_deleted }}",
+        "network_shares_accessed": "{{ $exec.artifacts.network_shares_accessed }}",
+        "zero_tolerance_trigger": "{{ $exec.rule_id == '100022' or $exec.rule_id == '100024' }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_zero_tolerance_gate",
+      "name": "Zero-Tolerance Pre-Check",
+      "type": "condition",
+      "description": "Shadow copy deletion and known ransomware binary names bypass the full enrichment pipeline and trigger immediate isolation. These two indicators have zero legitimate use cases in production environments.",
+      "condition": "{{ $node_02_extract.zero_tolerance_trigger == true }}",
+      "true_branch": "node_08_isolate_host",
+      "false_branch": "node_04_vt_hash",
+      "depends_on": ["node_02_extract"]
+    },
+    {
+      "id": "node_04_vt_hash",
+      "name": "VirusTotal — File Hash Lookup",
+      "type": "action",
+      "app": "VirusTotal",
+      "action": "get_hash_report",
+      "description": "Submits process or file SHA256 to VirusTotal. Ransomware families have near-100% detection ratios across AV engines.",
+      "input": {
+        "apikey": "{{ variables.VIRUSTOTAL_API_KEY }}",
+        "id": "{{ $node_02_extract.file_hash }}"
+      },
+      "output_variables": {
+        "vt_malicious_count": "{{ $result.data.attributes.last_analysis_stats.malicious }}",
+        "vt_total_engines": "{{ $result.data.attributes.last_analysis_stats.total }}",
+        "vt_threat_label": "{{ $result.data.attributes.popular_threat_classification.suggested_threat_label }}",
+        "vt_detection_ratio": "{{ $result.data.attributes.last_analysis_stats.malicious / $result.data.attributes.last_analysis_stats.total * 100 }}",
+        "vt_family": "{{ $result.data.attributes.popular_threat_classification.popular_threat_name }}"
+      },
+      "depends_on": ["node_03_zero_tolerance_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_hybrid_analysis",
+      "name": "Hybrid Analysis — Sandbox Behavior Report",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Hybrid Analysis for existing sandbox detonation report on the file hash. Returns behavioral indicators: file modifications, registry changes, network C2 connections, and classification verdict.",
+      "input": {
+        "method": "GET",
+        "url": "https://www.hybrid-analysis.com/api/v2/search/hash",
+        "headers": {
+          "api-key": "{{ variables.HYBRID_ANALYSIS_API_KEY }}",
+          "User-Agent": "Falcon Sandbox"
+        },
+        "params": {
+          "hash": "{{ $node_02_extract.file_hash }}"
+        }
+      },
+      "output_variables": {
+        "ha_verdict": "{{ $result[0].verdict }}",
+        "ha_threat_score": "{{ $result[0].threat_score }}",
+        "ha_malware_family": "{{ $result[0].vx_family }}",
+        "ha_file_modifications": "{{ $result[0].file_metadata.file_compositions }}",
+        "ha_network_indicators": "{{ $result[0].network_mode }}"
+      },
+      "depends_on": ["node_03_zero_tolerance_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_blast_radius",
+      "name": "Blast Radius — Network Share Enumeration",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Wazuh API for other agents that have accessed the same network shares as the infected host in the past 60 minutes. Identifies potential lateral spread scope.",
+      "input": {
+        "method": "GET",
+        "url": "{{ secrets.WAZUH_API_URL }}/security/events",
+        "headers": {
+          "Authorization": "Bearer {{ secrets.WAZUH_API_TOKEN }}"
+        },
+        "params": {
+          "q": "rule.groups:network_share AND data.audit.file.name:{{ $node_02_extract.network_shares_accessed | join(',') }}",
+          "timeframe": "3600"
+        }
+      },
+      "output_variables": {
+        "affected_hosts": "{{ $result.data.affected_items | map('agent.name') | unique }}",
+        "affected_host_count": "{{ $result.data.total_affected_items }}",
+        "blast_radius_critical": "{{ $result.data.total_affected_items > 5 }}"
+      },
+      "depends_on": ["node_03_zero_tolerance_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_07_score",
+      "name": "Composite Threat Score Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Weights VT detection ratio, Hybrid Analysis threat score, file rename velocity, and blast radius spread into a composite 0-100 score.",
+      "input": {
+        "formula": "({{ $node_04_vt_hash.vt_detection_ratio }} * 0.4) + ({{ $node_05_hybrid_analysis.ha_threat_score }} * 0.3) + ({{ $node_02_extract.file_rename_count }} >= 50 ? 20 : {{ $node_02_extract.file_rename_count }} >= 20 ? 12 : 5) + ({{ $node_06_blast_radius.blast_radius_critical }} == true ? 10 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_04_vt_hash", "node_05_hybrid_analysis", "node_06_blast_radius"]
+    },
+    {
+      "id": "node_07b_score_gate",
+      "name": "Score Decision Gate",
+      "type": "condition",
+      "description": "Routes to isolation if composite score >= 65. Low-confidence behavioral signals (single extension rename, no VT hits) route to analyst review.",
+      "condition": "{{ $node_07_score.composite_score >= variables.THREAT_SCORE_THRESHOLD }}",
+      "true_branch": "node_08_isolate_host",
+      "false_branch": "node_11_escalate",
+      "depends_on": ["node_07_score"]
+    },
+    {
+      "id": "node_08_isolate_host",
+      "name": "CrowdStrike Falcon — Network Isolate Host",
+      "type": "action",
+      "app": "CrowdStrike Falcon",
+      "action": "contain_host",
+      "description": "Immediately isolates the infected endpoint from the network via CrowdStrike Falcon API. Host retains EDR agent connectivity for forensic investigation. Prevents lateral spread to network shares and domain controllers.",
+      "input": {
+        "client_id": "{{ variables.CROWDSTRIKE_CLIENT_ID }}",
+        "client_secret": "{{ variables.CROWDSTRIKE_CLIENT_SECRET }}",
+        "action_parameters": [
+          {
+            "name": "action_name",
+            "value": "contain"
+          }
+        ],
+        "ids": ["{{ $node_02_extract.agent_id }}"],
+        "comment": "PB-03 | Automated isolation — ransomware behavioral indicators. Score: {{ $node_07_score.composite_score }}. Rule: {{ $exec.rule_id }}"
+      },
+      "output_variables": {
+        "isolation_status": "{{ $result.resources[0].status }}",
+        "isolation_timestamp": "{{ $result.resources[0].contained_by }}",
+        "device_id": "{{ $result.resources[0].device_id }}"
+      },
+      "depends_on": ["node_03_zero_tolerance_gate", "node_07b_score_gate"]
+    },
+    {
+      "id": "node_09_disable_user",
+      "name": "Active Directory — Disable Compromised Account",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "disable_user",
+      "description": "Disables the AD account of the user running the ransomware process. Prevents the attacker from pivoting to other systems using the same credentials.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.username }}",
+        "action": "disable",
+        "reason": "PB-03 | Automated disable — ransomware process executed under this account"
+      },
+      "output_variables": {
+        "ad_disable_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_08_isolate_host"],
+      "parallel_group": "post_isolation"
+    },
+    {
+      "id": "node_10_block_c2",
+      "name": "Firewall — Block C2 Network Indicators",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "If Hybrid Analysis returned C2 network indicators (IPs or domains), pushes them to the perimeter firewall blocklist to prevent ransomware from communicating with the attacker's key server.",
+      "condition": "{{ $node_05_hybrid_analysis.ha_network_indicators != null }}",
+      "input": {
+        "method": "POST",
+        "url": "{{ secrets.FIREWALL_API_URL }}/api/v1/blocklist",
+        "headers": {
+          "Authorization": "Bearer {{ secrets.FIREWALL_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "indicators": "{{ $node_05_hybrid_analysis.ha_network_indicators | map(i => ({ type: 'ip', value: i, reason: 'PB-03 Ransomware C2 from Hybrid Analysis', ttl_days: 90 })) }}"
+        }
+      },
+      "depends_on": ["node_08_isolate_host"],
+      "parallel_group": "post_isolation"
+    },
+    {
+      "id": "node_11_escalate",
+      "name": "TheHive — Create Critical Incident Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a Severity 3 (High) or 4 (Critical) incident case in TheHive. Populates with full forensic artifact data, enrichment results, blast radius scope, containment actions, and IR next steps checklist.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-03 | RANSOMWARE — {{ $node_02_extract.hostname }} | {{ $node_04_vt_hash.vt_family | default($node_05_hybrid_analysis.ha_malware_family) | default('Unknown Family') }} | Score: {{ $node_07_score.composite_score }}",
+        "severity": "{{ $node_06_blast_radius.blast_radius_critical == true ? 4 : 3 }}",
+        "tags": ["ransomware", "pb03", "endpoint", "host-isolation", "{{ $node_04_vt_hash.vt_family | default('unknown-family') }}"],
+        "description": "## RANSOMWARE INCIDENT — Automated IR Pipeline Output\n\n> **AUTO-CONTAINED:** {{ $node_08_isolate_host.isolation_status }}\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule Triggered:** {{ $exec.rule_name }}\n**Composite Threat Score:** {{ $node_07_score.composite_score }} / 100\n\n### Infected Host\n| Field | Value |\n|---|---|\n| Hostname | {{ $node_02_extract.hostname }} |\n| Agent ID | {{ $node_02_extract.agent_id }} |\n| Username | {{ $node_02_extract.username }} |\n| Process Name | {{ $node_02_extract.process_name }} |\n| Process ID | {{ $node_02_extract.process_id }} |\n| Command Line | {{ $node_02_extract.command_line }} |\n| File Rename Count | {{ $node_02_extract.file_rename_count }} |\n| Shadow Copy Deleted | {{ $node_02_extract.shadow_copy_deleted }} |\n\n### File Hash Enrichment\n| Source | Finding |\n|---|---|\n| VirusTotal | {{ $node_04_vt_hash.vt_malicious_count }}/{{ $node_04_vt_hash.vt_total_engines }} engines · {{ $node_04_vt_hash.vt_threat_label }} · Family: {{ $node_04_vt_hash.vt_family }} |\n| Hybrid Analysis | Verdict: {{ $node_05_hybrid_analysis.ha_verdict }} · Score: {{ $node_05_hybrid_analysis.ha_threat_score }} · Family: {{ $node_05_hybrid_analysis.ha_malware_family }} |\n\n### Blast Radius\n| Field | Value |\n|---|---|\n| Network Shares Accessed | {{ $node_02_extract.network_shares_accessed | join(', ') }} |\n| Potentially Affected Hosts | {{ $node_06_blast_radius.affected_host_count }} |\n| Affected Hostnames | {{ $node_06_blast_radius.affected_hosts | join(', ') }} |\n| Critical Blast Radius | {{ $node_06_blast_radius.blast_radius_critical }} |\n\n### Containment Actions Taken\n| Action | Status |\n|---|---|\n| CrowdStrike Host Isolation | {{ $node_08_isolate_host.isolation_status }} |\n| AD Account Disabled | {{ $node_09_disable_user.ad_disable_status }} |\n| C2 Indicators Firewall Blocked | {{ $node_10_block_c2.result }} |\n\n### IR Checklist — Analyst Next Steps\n- [ ] Confirm isolation via CrowdStrike console — verify host is fully contained\n- [ ] Identify Patient Zero — review Wazuh FIM timeline for first file modification event\n- [ ] Scope encrypted files — run find/dir on affected shares for renamed extensions\n- [ ] Assess backup integrity — confirm Veeam/backup snapshots predate encryption event\n- [ ] Check all hosts in blast radius list for matching IOCs\n- [ ] Determine ransomware family — use VT family tag to pull known decryptor tools (NoMoreRansom.org)\n- [ ] Escalate to IR lead and legal/compliance if PII data confirmed in encrypted files\n- [ ] Do NOT pay ransom without executive and legal sign-off\n- [ ] Re-enable AD account only after host reimaged and confirmed clean",
+        "observables": [
+          { "dataType": "hostname", "data": "{{ $node_02_extract.hostname }}", "message": "Ransomware-infected endpoint" },
+          { "dataType": "hash", "data": "{{ $node_02_extract.file_hash }}", "message": "Ransomware binary SHA256" },
+          { "dataType": "username", "data": "{{ $node_02_extract.username }}", "message": "Account running ransomware process" },
+          { "dataType": "process", "data": "{{ $node_02_extract.process_name }}", "message": "Ransomware process name" }
+        ]
+      },
+      "depends_on": ["node_07b_score_gate", "node_09_disable_user", "node_10_block_c2"]
+    },
+    {
+      "id": "node_12_notify",
+      "name": "Slack — Critical Incident Notification",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts to both the SOC channel and the critical incidents channel. Ransomware is always a P1 — IR lead, management, and legal must be looped in immediately.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "channel": "{{ variables.SLACK_CRITICAL_CHANNEL }}",
+          "text": "*:rotating_light: PB-03 | RANSOMWARE DETECTED & CONTAINED :rotating_light:*",
+          "attachments": [
+            {
+              "color": "#E24B4A",
+              "fields": [
+                { "title": "Threat Score", "value": "{{ $node_07_score.composite_score }} / 100", "short": true },
+                { "title": "Host Isolated", "value": "{{ $node_08_isolate_host.isolation_status }}", "short": true },
+                { "title": "Infected Host", "value": "{{ $node_02_extract.hostname }}", "short": true },
+                { "title": "Malware Family", "value": "{{ $node_04_vt_hash.vt_family | default($node_05_hybrid_analysis.ha_malware_family) | default('Unknown — analyst review') }}", "short": true },
+                { "title": "Running As", "value": "{{ $node_02_extract.username }}", "short": true },
+                { "title": "Files Renamed", "value": "{{ $node_02_extract.file_rename_count }}", "short": true },
+                { "title": "Shadow Copies Deleted", "value": "{{ $node_02_extract.shadow_copy_deleted }}", "short": true },
+                { "title": "Blast Radius", "value": "{{ $node_06_blast_radius.affected_host_count }} potentially affected hosts", "short": true },
+                { "title": "AD Account", "value": "Disabled — {{ $node_09_disable_user.ad_disable_status }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_11_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_11_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    "node_03_zero_tolerance_gate",
+    ["node_04_vt_hash", "node_05_hybrid_analysis", "node_06_blast_radius"],
+    "node_07_score",
+    "node_07b_score_gate",
+    "node_08_isolate_host",
+    ["node_09_disable_user", "node_10_block_c2"],
+    "node_11_escalate",
+    "node_12_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Impact", "technique": "T1486", "name": "Data Encrypted for Impact" },
+    { "tactic": "Impact", "technique": "T1490", "name": "Inhibit System Recovery — Shadow Copy Deletion" },
+    { "tactic": "Lateral Movement", "technique": "T1021", "subtechnique": "T1021.002", "name": "Remote Services: SMB/Windows Admin Shares" },
+    { "tactic": "Defense Evasion", "technique": "T1562", "subtechnique": "T1562.001", "name": "Impair Defenses: Disable or Modify Tools" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — zero-tolerance triggers (shadow copy delete, known binary) bypass enrichment entirely",
+    "estimated_mttr_reduction": "Host isolated in < 5 seconds from alert fire for zero-tolerance triggers",
+    "analyst_touchpoint": "Always required — IR checklist embedded in TheHive case"
+  }
+}

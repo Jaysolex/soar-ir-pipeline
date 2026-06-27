@@ -1,0 +1,425 @@
+{
+  "id": "pb07-cve-patch-ticketing-v1",
+  "name": "PB-07 | Critical CVE Detection & Automated Patch Ticketing",
+  "description": "Production playbook. Ingests vulnerability scanner findings from Tenable/Nessus/OpenVAS, Windows patch status from WSUS/SCCM, and CISA KEV alerts from Wazuh. Enriches CVE data via NVD and CISA KEV API. Assesses host criticality and network exposure. Auto-generates prioritized patch tickets in Jira with SLA deadlines, assigns to the correct team, and creates TheHive tracking cases for actively exploited CVEs.",
+  "tags": ["vulnerability", "cve", "patch-management", "tenable", "jira", "compliance", "pb07"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_cve_07",
+    "description": "Listens for Wazuh vulnerability and patch alerts on rule group: vulnerability,pb07 at level >= 11"
+  },
+  "variables": {
+    "NVD_API_KEY": "{{ secrets.NVD_API_KEY }}",
+    "TENABLE_ACCESS_KEY": "{{ secrets.TENABLE_ACCESS_KEY }}",
+    "TENABLE_SECRET_KEY": "{{ secrets.TENABLE_SECRET_KEY }}",
+    "JIRA_URL": "{{ secrets.JIRA_URL }}",
+    "JIRA_API_TOKEN": "{{ secrets.JIRA_API_TOKEN }}",
+    "JIRA_PROJECT_KEY": "{{ secrets.JIRA_PROJECT_KEY }}",
+    "JIRA_VULN_ASSIGNEE_CRITICAL": "{{ secrets.JIRA_VULN_ASSIGNEE_CRITICAL }}",
+    "JIRA_VULN_ASSIGNEE_HIGH": "{{ secrets.JIRA_VULN_ASSIGNEE_HIGH }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "SLACK_VULN_CHANNEL": "{{ secrets.SLACK_VULN_CHANNEL }}",
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "CVSS_CRITICAL_THRESHOLD": 9.0,
+    "CVSS_HIGH_THRESHOLD": 7.0,
+    "SLA_CRITICAL_DAYS": 7,
+    "SLA_HIGH_DAYS": 30,
+    "SLA_MEDIUM_DAYS": 90,
+    "CISA_KEV_AUTO_TICKET": true
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives vulnerability scanner or patch management alert payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "source": "string",
+        "artifacts": {
+          "cve_id": "string",
+          "cvss_score": "float",
+          "cvss_vector": "string",
+          "vulnerability_name": "string",
+          "vulnerability_type": "string",
+          "affected_hostname": "string",
+          "affected_ip": "string",
+          "affected_os": "string",
+          "affected_software": "string",
+          "affected_version": "string",
+          "host_classification": "string",
+          "days_since_discovery": "integer",
+          "in_cisa_kev": "boolean",
+          "patch_available": "boolean",
+          "patch_kb": "string",
+          "plugin_id": "string"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Priority Classification",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes vulnerability alert fields. Pre-classifies ticket priority based on CVSS score, CISA KEV status, and host criticality. Determines SLA deadline based on priority tier.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "cve_id": "{{ $exec.artifacts.cve_id }}",
+        "cvss_score": "{{ $exec.artifacts.cvss_score }}",
+        "cvss_vector": "{{ $exec.artifacts.cvss_vector }}",
+        "vuln_name": "{{ $exec.artifacts.vulnerability_name }}",
+        "vuln_type": "{{ $exec.artifacts.vulnerability_type }}",
+        "affected_hostname": "{{ $exec.artifacts.affected_hostname }}",
+        "affected_ip": "{{ $exec.artifacts.affected_ip }}",
+        "affected_os": "{{ $exec.artifacts.affected_os }}",
+        "affected_software": "{{ $exec.artifacts.affected_software }}",
+        "affected_version": "{{ $exec.artifacts.affected_version }}",
+        "host_classification": "{{ $exec.artifacts.host_classification }}",
+        "days_since_discovery": "{{ $exec.artifacts.days_since_discovery | default(0) }}",
+        "in_cisa_kev": "{{ $exec.artifacts.in_cisa_kev | default(false) }}",
+        "patch_available": "{{ $exec.artifacts.patch_available }}",
+        "patch_kb": "{{ $exec.artifacts.patch_kb }}",
+        "initial_priority": "{{ $exec.artifacts.in_cisa_kev == true ? 'P1-Critical' : $exec.artifacts.cvss_score >= 9.0 ? 'P1-Critical' : $exec.artifacts.cvss_score >= 7.0 ? 'P2-High' : 'P3-Medium' }}",
+        "sla_days": "{{ $exec.artifacts.in_cisa_kev == true ? 7 : $exec.artifacts.cvss_score >= 9.0 ? variables.SLA_CRITICAL_DAYS : $exec.artifacts.cvss_score >= 7.0 ? variables.SLA_HIGH_DAYS : variables.SLA_MEDIUM_DAYS }}",
+        "sla_due_date": "{{ now() | add_days($exec.artifacts.in_cisa_kev == true ? 7 : $exec.artifacts.cvss_score >= 9.0 ? variables.SLA_CRITICAL_DAYS : variables.SLA_HIGH_DAYS) }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_nvd_lookup",
+      "name": "NVD API — Full CVE Detail Lookup",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries the NIST National Vulnerability Database API for full CVE details: description, CVSS v3.1 vector breakdown, CWE classification, affected CPE configurations, published date, and last modified date.",
+      "input": {
+        "method": "GET",
+        "url": "https://services.nvd.nist.gov/rest/json/cves/2.0",
+        "headers": {
+          "apiKey": "{{ variables.NVD_API_KEY }}"
+        },
+        "params": {
+          "cveId": "{{ $node_02_extract.cve_id }}"
+        }
+      },
+      "output_variables": {
+        "nvd_description": "{{ $result.vulnerabilities[0].cve.descriptions | filter(d => d.lang == 'en') | first | get('value') }}",
+        "nvd_cvss_v3_score": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.baseScore }}",
+        "nvd_cvss_v3_vector": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.vectorString }}",
+        "nvd_cvss_severity": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.baseSeverity }}",
+        "nvd_attack_vector": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.attackVector }}",
+        "nvd_attack_complexity": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.attackComplexity }}",
+        "nvd_privileges_required": "{{ $result.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.privilegesRequired }}",
+        "nvd_cwe": "{{ $result.vulnerabilities[0].cve.weaknesses[0].description[0].value }}",
+        "nvd_published": "{{ $result.vulnerabilities[0].cve.published }}",
+        "nvd_last_modified": "{{ $result.vulnerabilities[0].cve.lastModified }}",
+        "nvd_cpe_affected": "{{ $result.vulnerabilities[0].cve.configurations | map('nodes') | flatten | map('cpeMatch') | flatten | map('criteria') }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_04_cisa_kev",
+      "name": "CISA KEV API — Known Exploited Vulnerabilities Check",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries the CISA Known Exploited Vulnerabilities catalog to confirm if this CVE has been actively exploited in the wild. KEV entries include the required remediation due date set by CISA for US federal agencies — used as a reference SLA even in private sector.",
+      "input": {
+        "method": "GET",
+        "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+      },
+      "output_variables": {
+        "kev_confirmed": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | length > 0 }}",
+        "kev_vendor_project": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('vendorProject') }}",
+        "kev_product": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('product') }}",
+        "kev_short_description": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('shortDescription') }}",
+        "kev_required_action": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('requiredAction') }}",
+        "kev_due_date": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('dueDate') }}",
+        "kev_ransomware_use": "{{ $result.vulnerabilities | filter(v => v.cveID == $node_02_extract.cve_id) | first | get('knownRansomwareCampaignUse') }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_host_context",
+      "name": "Tenable — Host Asset Details & Vulnerability History",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Tenable.io asset API for full host context: operating system, installed software, open ports, vulnerability history, and asset criticality score (ACS). ACS is Tenable's proprietary host importance rating based on network centrality and asset value.",
+      "input": {
+        "method": "POST",
+        "url": "https://cloud.tenable.com/assets/search",
+        "headers": {
+          "X-ApiKeys": "accessKey={{ variables.TENABLE_ACCESS_KEY }}; secretKey={{ variables.TENABLE_SECRET_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "filter": {
+            "and": [
+              { "field": "ipv4", "operator": "eq", "value": "{{ $node_02_extract.affected_ip }}" }
+            ]
+          }
+        }
+      },
+      "output_variables": {
+        "asset_id": "{{ $result.assets[0].id }}",
+        "asset_criticality_score": "{{ $result.assets[0].acr_score }}",
+        "asset_fqdn": "{{ $result.assets[0].fqdns[0] }}",
+        "asset_os": "{{ $result.assets[0].operating_systems[0] }}",
+        "asset_open_ports": "{{ $result.assets[0].network_interfaces[0].ipv4s }}",
+        "asset_tags": "{{ $result.assets[0].tags | map('value') }}",
+        "asset_vuln_count_critical": "{{ $result.assets[0].counts.vulnerabilities.severity.critical }}",
+        "asset_vuln_count_high": "{{ $result.assets[0].counts.vulnerabilities.severity.high }}",
+        "asset_last_scan": "{{ $result.assets[0].last_seen }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_exposure_check",
+      "name": "Network Exposure Assessment",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Determines whether the vulnerability is exploitable from the internet based on host classification, CVSS attack vector, and open port context. Internet-facing hosts with network-exploitable CVEs represent maximum exposure.",
+      "input": {
+        "formula": {
+          "is_internet_facing": "{{ $node_02_extract.host_classification | contains('internet_facing') or $node_02_extract.host_classification | contains('dmz') }}",
+          "is_network_exploitable": "{{ $node_03_nvd_lookup.nvd_attack_vector == 'NETWORK' and $node_03_nvd_lookup.nvd_privileges_required == 'NONE' }}",
+          "is_critical_infrastructure": "{{ $node_02_extract.host_classification | contains('domain_controller') or $node_02_extract.host_classification | contains('database_server') or $node_02_extract.host_classification | contains('backup_server') }}",
+          "exposure_level": "{{ ($node_02_extract.host_classification | contains('internet_facing')) and ($node_03_nvd_lookup.nvd_attack_vector == 'NETWORK') ? 'CRITICAL_EXPOSURE' : ($node_02_extract.host_classification | contains('domain_controller')) ? 'HIGH_EXPOSURE' : 'STANDARD_EXPOSURE' }}"
+        }
+      },
+      "output_variables": {
+        "is_internet_facing": "{{ $result.is_internet_facing }}",
+        "is_network_exploitable": "{{ $result.is_network_exploitable }}",
+        "is_critical_infrastructure": "{{ $result.is_critical_infrastructure }}",
+        "exposure_level": "{{ $result.exposure_level }}"
+      },
+      "depends_on": ["node_03_nvd_lookup", "node_05_host_context"]
+    },
+    {
+      "id": "node_07_priority_score",
+      "name": "Vulnerability Priority Rating Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Calculates a Vulnerability Priority Rating (VPR) combining CVSS score, CISA KEV status, network exposure, host criticality, and ransomware use flags. Determines final ticket priority and SLA deadline.",
+      "input": {
+        "formula": "({{ $node_02_extract.cvss_score }} * 5) + ({{ $node_04_cisa_kev.kev_confirmed }} == true ? 25 : 0) + ({{ $node_06_exposure_check.is_internet_facing }} == true ? 20 : 0) + ({{ $node_06_exposure_check.is_critical_infrastructure }} == true ? 15 : 0) + ({{ $node_06_exposure_check.is_network_exploitable }} == true ? 10 : 0) + ({{ $node_04_cisa_kev.kev_ransomware_use }} == 'Known' ? 10 : 0) + ({{ $node_02_extract.days_since_discovery }} >= 30 ? 10 : 0)"
+      },
+      "output_variables": {
+        "vpr_score": "{{ $result }}",
+        "final_priority": "{{ $result >= 90 ? 'P1-Critical' : $result >= 70 ? 'P2-High' : $result >= 50 ? 'P3-Medium' : 'P4-Low' }}",
+        "final_sla_days": "{{ $result >= 90 ? 3 : $result >= 70 ? 7 : $result >= 50 ? 30 : 90 }}",
+        "final_sla_due": "{{ now() | add_days($result >= 90 ? 3 : $result >= 70 ? 7 : 30) }}"
+      },
+      "depends_on": ["node_06_exposure_check", "node_04_cisa_kev"]
+    },
+    {
+      "id": "node_08_duplicate_check",
+      "name": "Jira — Duplicate Ticket Check",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Searches Jira for an existing open ticket for this CVE on this host before creating a new one. Prevents duplicate tickets when the same vulnerability is detected in multiple scan cycles.",
+      "input": {
+        "method": "GET",
+        "url": "{{ variables.JIRA_URL }}/rest/api/3/search",
+        "headers": {
+          "Authorization": "Bearer {{ variables.JIRA_API_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "params": {
+          "jql": "project = {{ variables.JIRA_PROJECT_KEY }} AND summary ~ '{{ $node_02_extract.cve_id }}' AND text ~ '{{ $node_02_extract.affected_hostname }}' AND statusCategory != Done ORDER BY created DESC",
+          "maxResults": 1
+        }
+      },
+      "output_variables": {
+        "existing_ticket": "{{ $result.total > 0 }}",
+        "existing_ticket_key": "{{ $result.issues[0].key }}",
+        "existing_ticket_status": "{{ $result.issues[0].fields.status.name }}"
+      },
+      "depends_on": ["node_07_priority_score"]
+    },
+    {
+      "id": "node_09_ticket_decision",
+      "name": "Ticket Creation Decision Gate",
+      "type": "condition",
+      "description": "Creates new ticket if no existing open ticket found. If duplicate exists, updates the existing ticket with new scan data and re-evaluates priority instead of creating duplicate.",
+      "condition": "{{ $node_08_duplicate_check.existing_ticket == false }}",
+      "true_branch": "node_10_create_jira",
+      "false_branch": "node_10b_update_jira",
+      "depends_on": ["node_08_duplicate_check"]
+    },
+    {
+      "id": "node_10_create_jira",
+      "name": "Jira — Create Prioritized Patch Ticket",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Creates a structured Jira vulnerability remediation ticket with full CVE context, NVD details, CISA KEV status, host exposure assessment, SLA due date, and remediation steps. Assigns to the correct team based on priority.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.JIRA_URL }}/rest/api/3/issue",
+        "headers": {
+          "Authorization": "Bearer {{ variables.JIRA_API_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "fields": {
+            "project": { "key": "{{ variables.JIRA_PROJECT_KEY }}" },
+            "summary": "[{{ $node_07_priority_score.final_priority }}] {{ $node_02_extract.cve_id }} — {{ $node_02_extract.vuln_name }} on {{ $node_02_extract.affected_hostname }}",
+            "issuetype": { "name": "Security Vulnerability" },
+            "priority": { "name": "{{ $node_07_priority_score.final_priority == 'P1-Critical' ? 'Highest' : $node_07_priority_score.final_priority == 'P2-High' ? 'High' : 'Medium' }}" },
+            "assignee": { "accountId": "{{ $node_07_priority_score.final_priority == 'P1-Critical' ? variables.JIRA_VULN_ASSIGNEE_CRITICAL : variables.JIRA_VULN_ASSIGNEE_HIGH }}" },
+            "duedate": "{{ $node_07_priority_score.final_sla_due }}",
+            "labels": ["vulnerability", "pb07", "{{ $node_04_cisa_kev.kev_confirmed == true ? 'cisa-kev' : 'scanner-finding' }}", "{{ $node_02_extract.cve_id }}", "cvss-{{ $node_02_extract.cvss_score }}"],
+            "description": {
+              "type": "doc",
+              "version": 1,
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [{ "type": "text", "text": "## Vulnerability Summary\n\nCVE ID: {{ $node_02_extract.cve_id }}\nCVSS Score: {{ $node_02_extract.cvss_score }} ({{ $node_03_nvd_lookup.nvd_cvss_severity }})\nVPR Score: {{ $node_07_priority_score.vpr_score }}\nPriority: {{ $node_07_priority_score.final_priority }}\nSLA Due: {{ $node_07_priority_score.final_sla_due }} ({{ $node_07_priority_score.final_sla_days }} days)\nCISA KEV: {{ $node_04_cisa_kev.kev_confirmed }}\nKEV Ransomware Use: {{ $node_04_cisa_kev.kev_ransomware_use }}\n\n## Affected System\n\nHostname: {{ $node_02_extract.affected_hostname }}\nIP Address: {{ $node_02_extract.affected_ip }}\nOS: {{ $node_02_extract.affected_os }}\nSoftware: {{ $node_02_extract.affected_software }} {{ $node_02_extract.affected_version }}\nHost Classification: {{ $node_02_extract.host_classification }}\nExposure Level: {{ $node_06_exposure_check.exposure_level }}\nInternet Facing: {{ $node_06_exposure_check.is_internet_facing }}\nTenable ACR Score: {{ $node_05_host_context.asset_criticality_score }}\n\n## CVE Details (NVD)\n\nDescription: {{ $node_03_nvd_lookup.nvd_description }}\nCVSS v3.1 Vector: {{ $node_03_nvd_lookup.nvd_cvss_v3_vector }}\nAttack Vector: {{ $node_03_nvd_lookup.nvd_attack_vector }}\nAttack Complexity: {{ $node_03_nvd_lookup.nvd_attack_complexity }}\nPrivileges Required: {{ $node_03_nvd_lookup.nvd_privileges_required }}\nCWE Classification: {{ $node_03_nvd_lookup.nvd_cwe }}\nPublished: {{ $node_03_nvd_lookup.nvd_published }}\n\n## CISA KEV Details\n\nKEV Confirmed: {{ $node_04_cisa_kev.kev_confirmed }}\nVendor/Product: {{ $node_04_cisa_kev.kev_vendor_project }} — {{ $node_04_cisa_kev.kev_product }}\nRequired Action: {{ $node_04_cisa_kev.kev_required_action }}\nCISA Due Date: {{ $node_04_cisa_kev.kev_due_date }}\n\n## Remediation Steps\n\n1. Review the NVD advisory and vendor patch bulletin for {{ $node_02_extract.cve_id }}\n2. Download and test patch in UAT environment before production deployment\n3. Schedule maintenance window — SLA due date: {{ $node_07_priority_score.final_sla_due }}\n4. Apply patch: {{ $node_02_extract.patch_kb | default('See vendor advisory') }}\n5. Rescan affected host in Tenable post-patch to confirm remediation\n6. Update this ticket with patch completion date and close\n\n## References\n\nNVD: https://nvd.nist.gov/vuln/detail/{{ $node_02_extract.cve_id }}\nCISA KEV: https://www.cisa.gov/known-exploited-vulnerabilities-catalog\nTenable Asset: https://cloud.tenable.com/app.html#/assets/{{ $node_05_host_context.asset_id }}" }]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "output_variables": {
+        "jira_ticket_key": "{{ $result.key }}",
+        "jira_ticket_url": "{{ variables.JIRA_URL }}/browse/{{ $result.key }}",
+        "jira_ticket_id": "{{ $result.id }}"
+      },
+      "depends_on": ["node_09_ticket_decision"],
+      "branch": "true"
+    },
+    {
+      "id": "node_10b_update_jira",
+      "name": "Jira — Update Existing Ticket",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "If a duplicate ticket exists, adds a comment with updated scan data and re-evaluates priority. Prevents ticket sprawl while keeping the remediation record current.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.JIRA_URL }}/rest/api/3/issue/{{ $node_08_duplicate_check.existing_ticket_key }}/comment",
+        "headers": {
+          "Authorization": "Bearer {{ variables.JIRA_API_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "Automated scan update — PB-07 | {{ $exec.timestamp }}\n\nVulnerability re-detected on {{ $node_02_extract.affected_hostname }}.\nCurrent CVSS: {{ $node_02_extract.cvss_score }}\nUpdated VPR: {{ $node_07_priority_score.vpr_score }}\nDays since discovery: {{ $node_02_extract.days_since_discovery }}\nCISA KEV status: {{ $node_04_cisa_kev.kev_confirmed }}\n\nSLA breach risk: {{ $node_02_extract.days_since_discovery >= 25 ? 'HIGH — patch within 5 days to avoid SLA breach' : 'On track' }}" }]
+              }
+            ]
+          }
+        }
+      },
+      "output_variables": {
+        "jira_ticket_key": "{{ $node_08_duplicate_check.existing_ticket_key }}",
+        "jira_ticket_url": "{{ variables.JIRA_URL }}/browse/{{ $node_08_duplicate_check.existing_ticket_key }}"
+      },
+      "depends_on": ["node_09_ticket_decision"],
+      "branch": "false"
+    },
+    {
+      "id": "node_11_thehive_kev",
+      "name": "TheHive — Create Case for CISA KEV Vulnerabilities",
+      "type": "condition_action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a TheHive incident case only for CISA KEV confirmed CVEs and CVSS 9.0+ vulnerabilities on critical infrastructure. Lower severity findings are tracked in Jira only — TheHive is reserved for vulnerabilities with confirmed active exploitation.",
+      "condition": "{{ $node_04_cisa_kev.kev_confirmed == true or ($node_02_extract.cvss_score >= 9.0 and $node_06_exposure_check.is_internet_facing == true) }}",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-07 | {{ $node_04_cisa_kev.kev_confirmed == true ? 'CISA KEV' : 'CRITICAL CVE' }} — {{ $node_02_extract.cve_id }} on {{ $node_02_extract.affected_hostname }} | VPR: {{ $node_07_priority_score.vpr_score }}",
+        "severity": "{{ $node_04_cisa_kev.kev_ransomware_use == 'Known' ? 4 : $node_04_cisa_kev.kev_confirmed == true ? 3 : 2 }}",
+        "tags": ["vulnerability", "pb07", "{{ $node_02_extract.cve_id }}", "{{ $node_04_cisa_kev.kev_confirmed == true ? 'cisa-kev' : 'critical-cve' }}", "{{ $node_06_exposure_check.exposure_level | lower }}"],
+        "description": "## Actively Exploited Vulnerability — Urgent Remediation Required\n\n**CVE:** {{ $node_02_extract.cve_id }}\n**CVSS Score:** {{ $node_02_extract.cvss_score }} / 10\n**VPR Score:** {{ $node_07_priority_score.vpr_score }} / 100\n**Priority:** {{ $node_07_priority_score.final_priority }}\n**SLA Due:** {{ $node_07_priority_score.final_sla_due }}\n**Jira Ticket:** {{ $node_10_create_jira.jira_ticket_url | default($node_10b_update_jira.jira_ticket_url) }}\n\n### CISA KEV Status\n| Field | Value |\n|---|---|\n| KEV Confirmed | {{ $node_04_cisa_kev.kev_confirmed }} |\n| Vendor/Product | {{ $node_04_cisa_kev.kev_vendor_project }} — {{ $node_04_cisa_kev.kev_product }} |\n| Short Description | {{ $node_04_cisa_kev.kev_short_description }} |\n| Required Action | {{ $node_04_cisa_kev.kev_required_action }} |\n| CISA Due Date | {{ $node_04_cisa_kev.kev_due_date }} |\n| Ransomware Use | {{ $node_04_cisa_kev.kev_ransomware_use }} |\n\n### Affected System\n| Field | Value |\n|---|---|\n| Hostname | {{ $node_02_extract.affected_hostname }} |\n| IP | {{ $node_02_extract.affected_ip }} |\n| OS | {{ $node_02_extract.affected_os }} |\n| Software | {{ $node_02_extract.affected_software }} {{ $node_02_extract.affected_version }} |\n| Host Classification | {{ $node_02_extract.host_classification }} |\n| Exposure Level | {{ $node_06_exposure_check.exposure_level }} |\n| Internet Facing | {{ $node_06_exposure_check.is_internet_facing }} |\n| Tenable ACR | {{ $node_05_host_context.asset_criticality_score }} |\n| Open Vulnerabilities | Critical: {{ $node_05_host_context.asset_vuln_count_critical }} · High: {{ $node_05_host_context.asset_vuln_count_high }} |\n\n### CVE Technical Details\n| Field | Value |\n|---|---|\n| Description | {{ $node_03_nvd_lookup.nvd_description }} |\n| CVSS v3.1 Vector | {{ $node_03_nvd_lookup.nvd_cvss_v3_vector }} |\n| Attack Vector | {{ $node_03_nvd_lookup.nvd_attack_vector }} |\n| Attack Complexity | {{ $node_03_nvd_lookup.nvd_attack_complexity }} |\n| Privileges Required | {{ $node_03_nvd_lookup.nvd_privileges_required }} |\n| CWE | {{ $node_03_nvd_lookup.nvd_cwe }} |\n\n### Remediation Checklist\n- [ ] Verify Jira patch ticket created and assigned: {{ $node_10_create_jira.jira_ticket_url | default($node_10b_update_jira.jira_ticket_url) }}\n- [ ] Confirm patch exists and is available from vendor\n- [ ] Test patch in staging environment before production\n- [ ] Assess if temporary mitigations can reduce exposure while patch is applied (WAF rule, network ACL, service disable)\n- [ ] Schedule emergency maintenance window if CISA KEV confirmed\n- [ ] Scan all hosts running {{ $node_02_extract.affected_software }} {{ $node_02_extract.affected_version }} for the same CVE\n- [ ] Verify patch applied — rescan host in Tenable post-remediation\n- [ ] Close Jira ticket and this case with remediation evidence",
+        "observables": [
+          { "dataType": "other", "data": "{{ $node_02_extract.cve_id }}", "message": "CVE identifier" },
+          { "dataType": "ip", "data": "{{ $node_02_extract.affected_ip }}", "message": "Affected host IP" },
+          { "dataType": "hostname", "data": "{{ $node_02_extract.affected_hostname }}", "message": "Affected host" },
+          { "dataType": "other", "data": "CVSS {{ $node_02_extract.cvss_score }} — VPR {{ $node_07_priority_score.vpr_score }}", "message": "Risk scores" }
+        ]
+      },
+      "depends_on": ["node_10_create_jira", "node_10b_update_jira"]
+    },
+    {
+      "id": "node_12_notify",
+      "name": "Slack — Vulnerability Alert",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts structured vulnerability alert to the vuln management channel. CISA KEV and critical exposure vulnerabilities get elevated color and messaging.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "channel": "{{ variables.SLACK_VULN_CHANNEL }}",
+          "text": "*PB-07 | {{ $node_04_cisa_kev.kev_confirmed == true ? ':rotating_light: CISA KEV — ACTIVELY EXPLOITED' : 'Vulnerability Alert' }}*",
+          "attachments": [
+            {
+              "color": "{{ $node_07_priority_score.final_priority == 'P1-Critical' ? '#E24B4A' : $node_07_priority_score.final_priority == 'P2-High' ? '#EF9F27' : '#378ADD' }}",
+              "fields": [
+                { "title": "CVE", "value": "{{ $node_02_extract.cve_id }}", "short": true },
+                { "title": "Priority", "value": "{{ $node_07_priority_score.final_priority }} (VPR: {{ $node_07_priority_score.vpr_score }})", "short": true },
+                { "title": "CVSS Score", "value": "{{ $node_02_extract.cvss_score }} / 10 — {{ $node_03_nvd_lookup.nvd_cvss_severity }}", "short": true },
+                { "title": "SLA Due", "value": "{{ $node_07_priority_score.final_sla_due }} ({{ $node_07_priority_score.final_sla_days }} days)", "short": true },
+                { "title": "Affected Host", "value": "{{ $node_02_extract.affected_hostname }} ({{ $node_02_extract.affected_ip }})", "short": true },
+                { "title": "Exposure", "value": "{{ $node_06_exposure_check.exposure_level }}", "short": true },
+                { "title": "CISA KEV", "value": "{{ $node_04_cisa_kev.kev_confirmed }}", "short": true },
+                { "title": "Ransomware Use", "value": "{{ $node_04_cisa_kev.kev_ransomware_use | default('None') }}", "short": true },
+                { "title": "Software", "value": "{{ $node_02_extract.affected_software }} {{ $node_02_extract.affected_version }}", "short": true },
+                { "title": "Jira Ticket", "value": "{{ $node_10_create_jira.jira_ticket_url | default($node_10b_update_jira.jira_ticket_url) }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_11_thehive_kev"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    ["node_03_nvd_lookup", "node_04_cisa_kev", "node_05_host_context"],
+    "node_06_exposure_check",
+    "node_07_priority_score",
+    "node_08_duplicate_check",
+    "node_09_ticket_decision",
+    ["node_10_create_jira", "node_10b_update_jira"],
+    "node_11_thehive_kev",
+    "node_12_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Initial Access", "technique": "T1190", "name": "Exploit Public-Facing Application" },
+    { "tactic": "Privilege Escalation", "technique": "T1068", "name": "Exploitation for Privilege Escalation" },
+    { "tactic": "Lateral Movement", "technique": "T1210", "name": "Exploitation of Remote Services" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — scanner findings streamed immediately vs. weekly report review",
+    "estimated_mttr_reduction": "Patch ticket created with full context in < 10 seconds vs. 30-60 min manual triage",
+    "duplicate_prevention": "Jira search before creation prevents ticket sprawl across scan cycles",
+    "kev_sla": "CISA KEV CVEs get 3-day SLA vs. standard 7-day critical — aligned with federal remediation mandate"
+  }
+}

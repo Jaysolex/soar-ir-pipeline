@@ -1,0 +1,410 @@
+{
+  "id": "pb06-data-exfiltration-v1",
+  "name": "PB-06 | Data Exfiltration Alert Triage",
+  "description": "Production playbook. Ingests data loss prevention alerts from Wazuh, proxy logs, email gateways, and DLP endpoint agents. Enriches destination IPs and domains, classifies data sensitivity, evaluates user context and recent HR signals, and calculates exfiltration risk score. Routes to automated firewall block and endpoint quarantine or structured analyst escalation with full evidence package.",
+  "tags": ["data-exfiltration", "dlp", "insider-threat", "network", "pb06"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_exfiltration_06",
+    "description": "Listens for Wazuh DLP and network exfiltration alerts on rule group: data_exfiltration,pb06 at level >= 12"
+  },
+  "variables": {
+    "VIRUSTOTAL_API_KEY": "{{ secrets.VIRUSTOTAL_API_KEY }}",
+    "ABUSEIPDB_API_KEY": "{{ secrets.ABUSEIPDB_API_KEY }}",
+    "MAXMIND_LICENSE_KEY": "{{ secrets.MAXMIND_LICENSE_KEY }}",
+    "M365_TENANT_ID": "{{ secrets.M365_TENANT_ID }}",
+    "M365_CLIENT_ID": "{{ secrets.M365_CLIENT_ID }}",
+    "M365_CLIENT_SECRET": "{{ secrets.M365_CLIENT_SECRET }}",
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "CROWDSTRIKE_CLIENT_ID": "{{ secrets.CROWDSTRIKE_CLIENT_ID }}",
+    "CROWDSTRIKE_CLIENT_SECRET": "{{ secrets.CROWDSTRIKE_CLIENT_SECRET }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "FIREWALL_API_URL": "{{ secrets.FIREWALL_API_URL }}",
+    "FIREWALL_API_KEY": "{{ secrets.FIREWALL_API_KEY }}",
+    "WAZUH_API_URL": "{{ secrets.WAZUH_API_URL }}",
+    "WAZUH_API_TOKEN": "{{ secrets.WAZUH_API_TOKEN }}",
+    "THREAT_SCORE_THRESHOLD": 70,
+    "LARGE_TRANSFER_BYTES": 52428800,
+    "APPROVED_CLOUD_DOMAINS": ["sharepoint.com", "onedrive.com", "drive.google.com", "box.com"]
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives DLP, proxy, email gateway, or network flow exfiltration alert payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "source": "string",
+        "artifacts": {
+          "hostname": "string",
+          "agent_id": "string",
+          "username": "string",
+          "source_ip": "string",
+          "destination_ip": "string",
+          "destination_domain": "string",
+          "destination_country": "string",
+          "bytes_sent": "integer",
+          "protocol": "string",
+          "port": "integer",
+          "file_names": "array",
+          "data_classification": "string",
+          "attachment_size_bytes": "integer",
+          "recipient_email": "string",
+          "exfil_method": "string",
+          "session_duration_seconds": "integer"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Method Classification",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes exfiltration artifacts. Classifies the exfiltration method (network transfer, cloud upload, email, USB, DNS tunnel) and converts bytes to MB for human-readable output.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "hostname": "{{ $exec.artifacts.hostname }}",
+        "agent_id": "{{ $exec.artifacts.agent_id }}",
+        "username": "{{ $exec.artifacts.username }}",
+        "source_ip": "{{ $exec.artifacts.source_ip }}",
+        "destination_ip": "{{ $exec.artifacts.destination_ip }}",
+        "destination_domain": "{{ $exec.artifacts.destination_domain }}",
+        "bytes_sent": "{{ $exec.artifacts.bytes_sent }}",
+        "bytes_sent_mb": "{{ ($exec.artifacts.bytes_sent / 1048576) | round(2) }}",
+        "protocol": "{{ $exec.artifacts.protocol }}",
+        "file_names": "{{ $exec.artifacts.file_names }}",
+        "data_classification": "{{ $exec.artifacts.data_classification }}",
+        "recipient_email": "{{ $exec.artifacts.recipient_email }}",
+        "exfil_method": "{{ $exec.artifacts.exfil_method }}",
+        "is_classified_data": "{{ $exec.artifacts.data_classification | contains('Confidential') or $exec.artifacts.data_classification | contains('Restricted') or $exec.artifacts.data_classification | contains('PII') or $exec.artifacts.data_classification | contains('PHI') or $exec.artifacts.data_classification | contains('PCI') }}",
+        "is_unapproved_cloud": "{{ not (variables.APPROVED_CLOUD_DOMAINS | contains($exec.artifacts.destination_domain)) }}",
+        "transfer_over_threshold": "{{ $exec.artifacts.bytes_sent >= variables.LARGE_TRANSFER_BYTES }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_dest_reputation",
+      "name": "VirusTotal — Destination Domain / IP Reputation",
+      "type": "action",
+      "app": "VirusTotal",
+      "action": "get_domain_report",
+      "description": "Checks the destination domain or IP against VirusTotal. Malicious or suspicious destinations significantly increase the risk score — legitimate data loss to a clean domain is a different risk than exfiltration to known malware C2 infrastructure.",
+      "input": {
+        "apikey": "{{ variables.VIRUSTOTAL_API_KEY }}",
+        "id": "{{ $node_02_extract.destination_domain | default($node_02_extract.destination_ip) }}"
+      },
+      "output_variables": {
+        "dest_vt_malicious": "{{ $result.data.attributes.last_analysis_stats.malicious }}",
+        "dest_vt_suspicious": "{{ $result.data.attributes.last_analysis_stats.suspicious }}",
+        "dest_vt_categories": "{{ $result.data.attributes.categories }}",
+        "dest_is_malicious": "{{ $result.data.attributes.last_analysis_stats.malicious > 0 }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_04_dest_geoip",
+      "name": "MaxMind GeoIP — Destination Country & ASN",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Resolves destination IP to country and ASN. High-risk countries (sanctioned, adversarial nation-state infrastructure) add to the risk score.",
+      "input": {
+        "method": "GET",
+        "url": "https://geolite.info/geoip/v2.1/city/{{ $node_02_extract.destination_ip }}",
+        "headers": {
+          "Authorization": "Basic {{ variables.MAXMIND_LICENSE_KEY | base64encode }}"
+        }
+      },
+      "output_variables": {
+        "dest_country": "{{ $result.country.iso_code }}",
+        "dest_city": "{{ $result.city.names.en }}",
+        "dest_asn": "{{ $result.traits.autonomous_system_organization }}",
+        "dest_is_hosting": "{{ $result.traits.is_hosting_provider }}",
+        "dest_high_risk_country": "{{ $result.country.iso_code | contains('CN') or $result.country.iso_code | contains('RU') or $result.country.iso_code | contains('KP') or $result.country.iso_code | contains('IR') }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_user_context",
+      "name": "Active Directory — User Context & HR Signals",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "get_user",
+      "description": "Pulls AD user context. Critically checks extensionAttribute3 for HR signals — pending termination, PIP (Performance Improvement Plan), or recent resignation notice. These signals dramatically increase insider threat risk score.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.username }}"
+      },
+      "output_variables": {
+        "user_display_name": "{{ $result.displayName }}",
+        "user_department": "{{ $result.department }}",
+        "user_job_title": "{{ $result.jobTitle }}",
+        "user_manager": "{{ $result.manager }}",
+        "user_groups": "{{ $result.memberOf }}",
+        "user_account_expires": "{{ $result.accountExpires }}",
+        "hr_signal": "{{ $result.extensionAttribute3 }}",
+        "is_pending_termination": "{{ $result.extensionAttribute3 | contains('pending_termination') or $result.extensionAttribute3 | contains('resignation') or $result.extensionAttribute3 | contains('pip') }}",
+        "is_privileged": "{{ $result.memberOf | contains('Domain Admins') or $result.memberOf | contains('Data Stewards') }}",
+        "account_expires_soon": "{{ $result.accountExpires != null and days_until($result.accountExpires) <= 30 }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_activity_baseline",
+      "name": "Wazuh API — 30-Day User Activity Baseline",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Wazuh for the user's outbound transfer history over the past 30 days. Establishes a behavioral baseline — today's 200MB transfer means something different if the user normally transfers 300MB/day vs. if they typically transfer 5MB/day.",
+      "input": {
+        "method": "GET",
+        "url": "{{ variables.WAZUH_API_URL }}/security/events",
+        "headers": {
+          "Authorization": "Bearer {{ variables.WAZUH_API_TOKEN }}"
+        },
+        "params": {
+          "q": "data.artifacts.username:{{ $node_02_extract.username }} AND rule.groups:data_exfiltration",
+          "timeframe": "2592000",
+          "select": "data.artifacts.bytes_sent,timestamp"
+        }
+      },
+      "output_variables": {
+        "baseline_total_events": "{{ $result.data.total_affected_items }}",
+        "baseline_avg_bytes": "{{ $result.data.affected_items | map('data.artifacts.bytes_sent') | average }}",
+        "baseline_max_bytes": "{{ $result.data.affected_items | map('data.artifacts.bytes_sent') | max }}",
+        "is_anomalous_volume": "{{ $node_02_extract.bytes_sent > ($result.data.affected_items | map('data.artifacts.bytes_sent') | average) * 3 }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_07_m365_audit",
+      "name": "M365 Audit Log — Recent File Access & Email Activity",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries the Microsoft 365 Unified Audit Log for the user's recent file access, SharePoint downloads, Teams file shares, and email activity in the past 24 hours. Builds a complete exfiltration evidence chain.",
+      "input": {
+        "method": "GET",
+        "url": "https://management.azure.com/providers/Microsoft.Insights/eventtypes/management/values",
+        "headers": {
+          "Authorization": "Bearer {{ secrets.M365_AUDIT_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "params": {
+          "api-version": "2015-04-01",
+          "filter": "eventTimestamp ge '{{ now() | subtract_hours(24) }}' and caller eq '{{ $node_02_extract.username }}'"
+        }
+      },
+      "output_variables": {
+        "m365_file_downloads": "{{ $result.value | filter(e => e.operationName.value | contains('FileDownloaded')) | length }}",
+        "m365_email_forwards": "{{ $result.value | filter(e => e.operationName.value | contains('Set-Mailbox') or e.operationName.value | contains('New-InboxRule')) | length }}",
+        "m365_external_shares": "{{ $result.value | filter(e => e.operationName.value | contains('AddedToSecureLink') or e.operationName.value | contains('SharingSet')) | length }}",
+        "m365_suspicious_operations": "{{ $result.value | filter(e => e.operationName.value | contains('Remove-MailboxPermission') or e.operationName.value | contains('Disable-InboxRule')) | length }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_08_score",
+      "name": "Composite Exfiltration Risk Score",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Weights destination reputation, data classification, HR signals, behavioral anomaly, and transfer volume into a 0-100 exfiltration risk score. HR signals (pending termination) carry the highest single weight — the most dangerous insider is always the one who knows they are leaving.",
+      "input": {
+        "formula": "({{ $node_05_user_context.is_pending_termination }} == true ? 30 : 0) + ({{ $node_02_extract.is_classified_data }} == true ? 20 : 0) + ({{ $node_03_dest_reputation.dest_is_malicious }} == true ? 20 : 0) + ({{ $node_06_activity_baseline.is_anomalous_volume }} == true ? 15 : 0) + ({{ $node_04_dest_geoip.dest_high_risk_country }} == true ? 10 : 0) + ({{ $node_02_extract.is_unapproved_cloud }} == true ? 10 : 0) + ({{ $node_05_user_context.account_expires_soon }} == true ? 10 : 0) + ({{ $node_07_m365_audit.m365_email_forwards }} > 0 ? 10 : 0) - ({{ $node_03_dest_reputation.dest_is_malicious }} == false and {{ $node_04_dest_geoip.dest_high_risk_country }} == false ? 5 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_03_dest_reputation", "node_04_dest_geoip", "node_05_user_context", "node_06_activity_baseline", "node_07_m365_audit"]
+    },
+    {
+      "id": "node_09_decision",
+      "name": "Exfiltration Risk Decision Gate",
+      "type": "condition",
+      "description": "Routes to automated block and quarantine if score >= 70. Lower-confidence signals (large transfer to clean destination, no HR signal, no classified data) route to analyst for review. Classified data going to a malicious destination is always contained regardless of score.",
+      "condition": "{{ $node_08_score.composite_score >= variables.THREAT_SCORE_THRESHOLD or ($node_02_extract.is_classified_data == true and $node_03_dest_reputation.dest_is_malicious == true) }}",
+      "true_branch": "node_10_block_destination",
+      "false_branch": "node_13_escalate",
+      "depends_on": ["node_08_score"]
+    },
+    {
+      "id": "node_10_block_destination",
+      "name": "Firewall — Block Destination IP & Domain",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Blocks the exfiltration destination at the perimeter firewall. Stops any ongoing transfer and prevents re-attempt from any host on the network.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.FIREWALL_API_URL }}/api/v1/blocklist",
+        "headers": {
+          "Authorization": "Bearer {{ variables.FIREWALL_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "indicators": [
+            {
+              "type": "ip",
+              "value": "{{ $node_02_extract.destination_ip }}",
+              "reason": "PB-06 Data exfiltration destination — score: {{ $node_08_score.composite_score }}",
+              "ttl_hours": 72
+            },
+            {
+              "type": "domain",
+              "value": "{{ $node_02_extract.destination_domain }}",
+              "reason": "PB-06 Data exfiltration destination domain",
+              "ttl_hours": 72
+            }
+          ]
+        }
+      },
+      "output_variables": {
+        "block_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_09_decision"],
+      "branch": "true",
+      "parallel_group": "containment"
+    },
+    {
+      "id": "node_11_isolate_host",
+      "name": "CrowdStrike — Isolate Endpoint (High Score Only)",
+      "type": "condition_action",
+      "app": "CrowdStrike Falcon",
+      "action": "contain_host",
+      "description": "Isolates the endpoint from the network if score >= 85 OR classified data confirmed exfiltrated to malicious destination. Lower scores only block the destination — host isolation is reserved for confirmed high-severity exfiltration to prevent disruption of legitimate users.",
+      "condition": "{{ $node_08_score.composite_score >= 85 or ($node_02_extract.is_classified_data == true and $node_03_dest_reputation.dest_is_malicious == true) }}",
+      "input": {
+        "client_id": "{{ variables.CROWDSTRIKE_CLIENT_ID }}",
+        "client_secret": "{{ variables.CROWDSTRIKE_CLIENT_SECRET }}",
+        "ids": ["{{ $node_02_extract.agent_id }}"],
+        "action_parameters": [{ "name": "action_name", "value": "contain" }],
+        "comment": "PB-06 | Exfiltration isolation. Score: {{ $node_08_score.composite_score }}. Classified: {{ $node_02_extract.is_classified_data }}. Malicious dest: {{ $node_03_dest_reputation.dest_is_malicious }}"
+      },
+      "output_variables": {
+        "isolation_status": "{{ $result.resources[0].status }}"
+      },
+      "depends_on": ["node_09_decision"],
+      "branch": "true",
+      "parallel_group": "containment"
+    },
+    {
+      "id": "node_12_revoke_m365",
+      "name": "M365 — Revoke Sessions & Block External Sharing",
+      "type": "action",
+      "app": "Microsoft Azure AD",
+      "action": "revoke_sign_in_sessions",
+      "description": "Revokes active M365 sessions to cut off any ongoing SharePoint/OneDrive exfiltration. Also calls the SharePoint admin API to disable external sharing for the user account.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "user_principal_name": "{{ $node_02_extract.username }}"
+      },
+      "output_variables": {
+        "m365_revoke_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_09_decision"],
+      "branch": "true",
+      "parallel_group": "containment"
+    },
+    {
+      "id": "node_13_escalate",
+      "name": "TheHive — Create DLP Incident Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a structured TheHive DLP incident case. Severity elevated to Critical if classified data confirmed exfiltrated or pending termination HR signal present. Includes full evidence chain from M365 audit log.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-06 | Data Exfiltration — {{ $node_02_extract.username }} → {{ $node_02_extract.destination_domain | default($node_02_extract.destination_ip) }} | {{ $node_02_extract.bytes_sent_mb }}MB | Score: {{ $node_08_score.composite_score }}",
+        "severity": "{{ $node_05_user_context.is_pending_termination == true or $node_02_extract.is_classified_data == true ? 3 : 2 }}",
+        "tags": ["data-exfiltration", "pb06", "dlp", "{{ $node_05_user_context.is_pending_termination == true ? 'insider-threat' : 'potential-exfiltration' }}", "{{ $node_02_extract.exfil_method }}"],
+        "description": "## Data Exfiltration Alert — Automated DLP Triage Output\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule:** {{ $exec.rule_name }}\n**Exfiltration Risk Score:** {{ $node_08_score.composite_score }} / 100\n**Auto-Contained:** {{ $node_09_decision.result }}\n\n### Exfiltration Event\n| Field | Value |\n|---|---|\n| Source Host | {{ $node_02_extract.hostname }} |\n| Username | {{ $node_02_extract.username }} |\n| Exfil Method | {{ $node_02_extract.exfil_method }} |\n| Data Volume | {{ $node_02_extract.bytes_sent_mb }} MB |\n| Files Involved | {{ $node_02_extract.file_names | join(', ') }} |\n| Data Classification | {{ $node_02_extract.data_classification }} |\n| Classified Data Confirmed | {{ $node_02_extract.is_classified_data }} |\n| Destination Domain | {{ $node_02_extract.destination_domain }} |\n| Destination IP | {{ $node_02_extract.destination_ip }} |\n| Recipient Email | {{ $node_02_extract.recipient_email }} |\n| Unapproved Cloud Service | {{ $node_02_extract.is_unapproved_cloud }} |\n\n### Destination Reputation\n| Source | Finding |\n|---|---|\n| VirusTotal | Malicious: {{ $node_03_dest_reputation.dest_vt_malicious }} · Suspicious: {{ $node_03_dest_reputation.dest_vt_suspicious }} · Categories: {{ $node_03_dest_reputation.dest_vt_categories }} |\n| MaxMind | Country: {{ $node_04_dest_geoip.dest_country }} · City: {{ $node_04_dest_geoip.dest_city }} · ASN: {{ $node_04_dest_geoip.dest_asn }} |\n| High-Risk Country | {{ $node_04_dest_geoip.dest_high_risk_country }} |\n| Hosting Provider | {{ $node_04_dest_geoip.dest_is_hosting }} |\n\n### User Context & HR Signals\n| Field | Value |\n|---|---|\n| Display Name | {{ $node_05_user_context.user_display_name }} |\n| Department | {{ $node_05_user_context.user_department }} |\n| Job Title | {{ $node_05_user_context.user_job_title }} |\n| Manager | {{ $node_05_user_context.user_manager }} |\n| HR Signal | {{ $node_05_user_context.hr_signal }} |\n| Pending Termination | {{ $node_05_user_context.is_pending_termination }} |\n| Account Expires Soon | {{ $node_05_user_context.account_expires_soon }} |\n\n### Behavioral Baseline (30 Days)\n| Field | Value |\n|---|---|\n| Previous Exfil Events | {{ $node_06_activity_baseline.baseline_total_events }} |\n| Average Transfer Volume | {{ ($node_06_activity_baseline.baseline_avg_bytes / 1048576) | round(2) }} MB |\n| Maximum Previous Transfer | {{ ($node_06_activity_baseline.baseline_max_bytes / 1048576) | round(2) }} MB |\n| Anomalous Volume (3× Avg) | {{ $node_06_activity_baseline.is_anomalous_volume }} |\n\n### M365 Audit Log (Last 24 Hours)\n| Activity | Count |\n|---|---|\n| File Downloads | {{ $node_07_m365_audit.m365_file_downloads }} |\n| Email Forwarding Rules Created | {{ $node_07_m365_audit.m365_email_forwards }} |\n| External File Shares | {{ $node_07_m365_audit.m365_external_shares }} |\n| Suspicious Operations | {{ $node_07_m365_audit.m365_suspicious_operations }} |\n\n### Containment Actions\n| Action | Status |\n|---|---|\n| Destination Firewall Block (72hr) | {{ $node_10_block_destination.block_status }} |\n| Endpoint Network Isolation | {{ $node_11_isolate_host.isolation_status }} |\n| M365 Sessions Revoked | {{ $node_12_revoke_m365.m365_revoke_status }} |\n\n### Analyst Investigation Checklist\n- [ ] Confirm data classification of transferred files with Data Owner\n- [ ] Review full file list transferred — determine if PII/PCI/PHI data was included\n- [ ] Contact user's manager ({{ $node_05_user_context.user_manager }}) — do not contact the user directly until HR and Legal are looped in if HR signal is present\n- [ ] Preserve forensic evidence — collect browser history, M365 audit logs, DLP agent logs before reimage\n- [ ] Check if destination domain is a personal cloud account (Google Drive, personal OneDrive)\n- [ ] Escalate to Legal and Compliance if classified data confirmed exfiltrated — PIPEDA/breach notification may apply\n- [ ] If insider threat confirmed — coordinate with HR and Legal before any user confrontation\n- [ ] Review for any accomplices — did the user share access with anyone before exfiltrating?",
+        "observables": [
+          { "dataType": "ip", "data": "{{ $node_02_extract.destination_ip }}", "message": "Exfiltration destination IP" },
+          { "dataType": "domain", "data": "{{ $node_02_extract.destination_domain }}", "message": "Exfiltration destination domain" },
+          { "dataType": "username", "data": "{{ $node_02_extract.username }}", "message": "Suspected exfiltrating user" },
+          { "dataType": "hostname", "data": "{{ $node_02_extract.hostname }}", "message": "Source endpoint" },
+          { "dataType": "other", "data": "{{ $node_02_extract.bytes_sent_mb }} MB transferred", "message": "Transfer volume" }
+        ]
+      },
+      "depends_on": ["node_08_score", "node_10_block_destination", "node_11_isolate_host", "node_12_revoke_m365"]
+    },
+    {
+      "id": "node_14_notify",
+      "name": "Slack — DLP & Insider Threat Alert",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts structured alert to SOC channel. If HR signal (pending termination) is present, also notifies the security manager and HR liaison channel — insider threat cases require immediate HR coordination.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "text": "*PB-06 | Data Exfiltration{{ $node_05_user_context.is_pending_termination == true ? ' — :rotating_light: INSIDER THREAT SIGNAL' : '' }}{{ $node_02_extract.is_classified_data == true ? ' — CLASSIFIED DATA' : '' }}*",
+          "attachments": [
+            {
+              "color": "{{ $node_08_score.composite_score >= 80 ? '#E24B4A' : $node_08_score.composite_score >= 70 ? '#EF9F27' : '#378ADD' }}",
+              "fields": [
+                { "title": "Risk Score", "value": "{{ $node_08_score.composite_score }} / 100", "short": true },
+                { "title": "Action", "value": "{{ $node_09_decision.result == true ? 'DEST BLOCKED + SESSIONS REVOKED' : 'ESCALATED TO ANALYST' }}", "short": true },
+                { "title": "User", "value": "{{ $node_02_extract.username }}", "short": true },
+                { "title": "Volume", "value": "{{ $node_02_extract.bytes_sent_mb }} MB", "short": true },
+                { "title": "Destination", "value": "{{ $node_02_extract.destination_domain | default($node_02_extract.destination_ip) }}", "short": true },
+                { "title": "Destination Country", "value": "{{ $node_04_dest_geoip.dest_country }}", "short": true },
+                { "title": "Classified Data", "value": "{{ $node_02_extract.is_classified_data }} — {{ $node_02_extract.data_classification }}", "short": true },
+                { "title": "Pending Termination", "value": "{{ $node_05_user_context.is_pending_termination }}", "short": true },
+                { "title": "Anomalous Volume", "value": "{{ $node_06_activity_baseline.is_anomalous_volume }}", "short": true },
+                { "title": "Dest Malicious (VT)", "value": "{{ $node_03_dest_reputation.dest_is_malicious }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_13_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_13_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    ["node_03_dest_reputation", "node_04_dest_geoip", "node_05_user_context", "node_06_activity_baseline", "node_07_m365_audit"],
+    "node_08_score",
+    "node_09_decision",
+    ["node_10_block_destination", "node_11_isolate_host", "node_12_revoke_m365"],
+    "node_13_escalate",
+    "node_14_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Exfiltration", "technique": "T1048", "name": "Exfiltration Over Alternative Protocol" },
+    { "tactic": "Exfiltration", "technique": "T1041", "name": "Exfiltration Over C2 Channel" },
+    { "tactic": "Exfiltration", "technique": "T1567", "subtechnique": "T1567.002", "name": "Exfiltration to Cloud Storage" },
+    { "tactic": "Exfiltration", "technique": "T1052", "subtechnique": "T1052.001", "name": "Exfiltration Over Physical Medium: USB" },
+    { "tactic": "Exfiltration", "technique": "T1071", "subtechnique": "T1071.004", "name": "Application Layer Protocol: DNS" },
+    { "tactic": "Collection", "technique": "T1114", "subtechnique": "T1114.003", "name": "Email Collection: Email Forwarding Rule" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — DLP events streamed immediately via webhook",
+    "estimated_mttr_reduction": "Destination blocked in < 5 seconds vs. 30-60 min manual firewall ticket",
+    "key_differentiator": "HR signal integration — pending termination flag from AD extensionAttribute drives highest risk weight"
+  }
+}

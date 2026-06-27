@@ -1,0 +1,48 @@
+<group name="phishing,email_security,">
+
+  <!-- Rule 1: User-reported phishing via email gateway or SIEM -->
+  <rule id="100001" level="12">
+    <decoded_as>json</decoded_as>
+    <field name="rule_name">Suspicious External Phishing Email Reported</field>
+    <description>PB-01 | Phishing email reported by user or blocked by gateway</description>
+    <options>no_full_log</options>
+    <group>phishing,email,pb01,</group>
+  </rule>
+
+  <!-- Rule 2: Executable attachment detected in email -->
+  <rule id="100002" level="14">
+    <decoded_as>json</decoded_as>
+    <field name="artifacts.attachment_name">\.exe$|\.bat$|\.ps1$|\.vbs$|\.js$|\.hta$|\.scr$|\.com$</field>
+    <description>PB-01 | Executable attachment detected in inbound email</description>
+    <options>no_full_log</options>
+    <group>phishing,email,malicious_attachment,pb01,</group>
+  </rule>
+
+  <!-- Rule 3: Double extension attachment (e.g. invoice.pdf.exe) -->
+  <rule id="100003" level="14">
+    <decoded_as>json</decoded_as>
+    <field name="artifacts.attachment_name">\.(pdf|doc|docx|xls|xlsx|zip)\.(exe|bat|ps1|vbs|js)$</field>
+    <description>PB-01 | Double-extension attachment detected — likely masquerading as document</description>
+    <options>no_full_log</options>
+    <group>phishing,email,double_extension,pb01,</group>
+  </rule>
+
+  <!-- Rule 4: High-urgency subject line keywords -->
+  <rule id="100004" level="10">
+    <decoded_as>json</decoded_as>
+    <field name="artifacts.subject">URGENT|IMMEDIATE|VERIFY NOW|Account Suspended|Banking Details|Password Expired|Click Immediately</field>
+    <description>PB-01 | High-urgency phishing subject line keyword detected</description>
+    <options>no_full_log</options>
+    <group>phishing,email,social_engineering,pb01,</group>
+  </rule>
+
+  <!-- Rule 5: Known malicious IP sending email -->
+  <rule id="100005" level="15">
+    <decoded_as>json</decoded_as>
+    <field name="artifacts.source_ip">^185\.220\.|^45\.142\.|^194\.165\.</field>
+    <description>PB-01 | Inbound email from known Tor exit node or malicious IP range</description>
+    <options>no_full_log</options>
+    <group>phishing,email,malicious_ip,pb01,</group>
+  </rule>
+
+</group>

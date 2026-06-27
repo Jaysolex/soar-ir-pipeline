@@ -1,0 +1,52 @@
+<group name="authentication,brute_force,credential_stuffing,">
+
+  <!-- Rule 1: Multiple failed logins from single IP (5 failures in 60s) -->
+  <rule id="100010" level="10" frequency="5" timeframe="60">
+    <if_matched_sid>18100</if_matched_sid>
+    <same_source_ip/>
+    <description>PB-02 | Brute force detected — 5+ failed logins from single IP within 60 seconds</description>
+    <group>brute_force,authentication,pb02,</group>
+  </rule>
+
+  <!-- Rule 2: Multiple failed logins targeting single account (spray pattern) -->
+  <rule id="100011" level="12" frequency="10" timeframe="120">
+    <if_matched_sid>18100</if_matched_sid>
+    <same_field>dstuser</same_field>
+    <description>PB-02 | Password spray detected — 10+ failed logins targeting single account in 120 seconds</description>
+    <group>brute_force,password_spray,authentication,pb02,</group>
+  </rule>
+
+  <!-- Rule 3: Failed login followed immediately by success (credential stuffing) -->
+  <rule id="100012" level="14">
+    <if_matched_sid>100010</if_matched_sid>
+    <field name="win.system.eventID">^4624$</field>
+    <description>PB-02 | Credential stuffing suspected — brute force immediately followed by successful login</description>
+    <group>brute_force,credential_stuffing,authentication,pb02,</group>
+  </rule>
+
+  <!-- Rule 4: Login from impossible geolocation (country mismatch) -->
+  <rule id="100013" level="13">
+    <decoded_as>json</decoded_as>
+    <field name="geoip.country_code2">!CA|!US</field>
+    <field name="win.system.eventID">^4624$</field>
+    <description>PB-02 | Successful login from unexpected country — potential impossible travel or account compromise</description>
+    <group>brute_force,geo_anomaly,authentication,pb02,</group>
+  </rule>
+
+  <!-- Rule 5: Admin account brute force (elevated severity) -->
+  <rule id="100014" level="15" frequency="3" timeframe="60">
+    <if_matched_sid>18100</if_matched_sid>
+    <field name="dstuser">admin|administrator|root|svc_|sa_|domain admin</field>
+    <description>PB-02 | Privileged account brute force — admin/service account targeted</description>
+    <group>brute_force,privileged_account,authentication,pb02,</group>
+  </rule>
+
+  <!-- Rule 6: Account locked out after threshold breached -->
+  <rule id="100015" level="10">
+    <decoded_as>windows_eventchannel</decoded_as>
+    <field name="win.system.eventID">^4740$</field>
+    <description>PB-02 | Windows account lockout event triggered (EventID 4740)</description>
+    <group>brute_force,account_lockout,authentication,pb02,</group>
+  </rule>
+
+</group>

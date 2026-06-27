@@ -1,0 +1,385 @@
+{
+  "id": "pb10-cloud-misconfiguration-v1",
+  "name": "PB-10 | Cloud Misconfiguration Triage & Auto-Remediation",
+  "description": "Production playbook. Ingests cloud misconfiguration alerts from AWS GuardDuty, AWS CloudTrail, and Azure Defender via Wazuh. Enriches findings with AWS Config, IAM context, resource tagging, and exposure assessment. Auto-remediates high-confidence misconfigurations (revoke public S3 ACL, close overly permissive security groups, revoke IAM over-permissions) or creates structured Jira remediation tickets with full context for analyst-driven remediation. Final playbook in the 10-playbook Autonomous IR Pipeline.",
+  "tags": ["cloud", "misconfiguration", "aws", "azure", "guardduty", "iam", "s3", "pb10"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_cloud_10",
+    "description": "Listens for Wazuh cloud misconfiguration alerts from AWS CloudTrail/GuardDuty and Azure Defender on rule group: cloud,pb10 at level >= 13"
+  },
+  "variables": {
+    "AWS_ACCESS_KEY_ID": "{{ secrets.AWS_ACCESS_KEY_ID }}",
+    "AWS_SECRET_ACCESS_KEY": "{{ secrets.AWS_SECRET_ACCESS_KEY }}",
+    "AWS_REGION": "{{ secrets.AWS_REGION }}",
+    "AZURE_TENANT_ID": "{{ secrets.AZURE_TENANT_ID }}",
+    "AZURE_CLIENT_ID": "{{ secrets.AZURE_CLIENT_ID }}",
+    "AZURE_CLIENT_SECRET": "{{ secrets.AZURE_CLIENT_SECRET }}",
+    "AZURE_SUBSCRIPTION_ID": "{{ secrets.AZURE_SUBSCRIPTION_ID }}",
+    "JIRA_URL": "{{ secrets.JIRA_URL }}",
+    "JIRA_API_TOKEN": "{{ secrets.JIRA_API_TOKEN }}",
+    "JIRA_CLOUD_PROJECT_KEY": "{{ secrets.JIRA_CLOUD_PROJECT_KEY }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "SLACK_CLOUD_CHANNEL": "{{ secrets.SLACK_CLOUD_CHANNEL }}",
+    "THREAT_SCORE_THRESHOLD": 65,
+    "ROOT_ACCOUNT_AUTO_REMEDIATE": true,
+    "PUBLIC_S3_AUTO_REMEDIATE": true,
+    "OPEN_SG_AUTO_REMEDIATE": true
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives cloud misconfiguration alert from Wazuh — AWS CloudTrail, GuardDuty, or Azure Defender.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "source": "string",
+        "artifacts": {
+          "cloud_provider": "string",
+          "account_id": "string",
+          "region": "string",
+          "resource_type": "string",
+          "resource_id": "string",
+          "resource_arn": "string",
+          "event_name": "string",
+          "actor_arn": "string",
+          "actor_type": "string",
+          "actor_username": "string",
+          "source_ip": "string",
+          "finding_type": "string",
+          "finding_severity": "float",
+          "affected_port": "integer",
+          "cidr_range": "string",
+          "bucket_name": "string",
+          "policy_arn": "string",
+          "is_public": "boolean",
+          "is_root": "boolean",
+          "guardduty_finding_id": "string"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Provider Classification",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes cloud alert fields across AWS and Azure sources. Classifies misconfiguration type and pre-flags zero-tolerance conditions — root account usage and public S3 buckets with sensitive data tags.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "cloud_provider": "{{ $exec.artifacts.cloud_provider }}",
+        "account_id": "{{ $exec.artifacts.account_id }}",
+        "region": "{{ $exec.artifacts.region }}",
+        "resource_type": "{{ $exec.artifacts.resource_type }}",
+        "resource_id": "{{ $exec.artifacts.resource_id }}",
+        "resource_arn": "{{ $exec.artifacts.resource_arn }}",
+        "event_name": "{{ $exec.artifacts.event_name }}",
+        "actor_arn": "{{ $exec.artifacts.actor_arn }}",
+        "actor_type": "{{ $exec.artifacts.actor_type }}",
+        "actor_username": "{{ $exec.artifacts.actor_username }}",
+        "source_ip": "{{ $exec.artifacts.source_ip }}",
+        "finding_type": "{{ $exec.artifacts.finding_type }}",
+        "finding_severity": "{{ $exec.artifacts.finding_severity | default(0) }}",
+        "affected_port": "{{ $exec.artifacts.affected_port }}",
+        "cidr_range": "{{ $exec.artifacts.cidr_range }}",
+        "bucket_name": "{{ $exec.artifacts.bucket_name }}",
+        "policy_arn": "{{ $exec.artifacts.policy_arn }}",
+        "is_public": "{{ $exec.artifacts.is_public | default(false) }}",
+        "is_root": "{{ $exec.artifacts.is_root | default(false) }}",
+        "guardduty_finding_id": "{{ $exec.artifacts.guardduty_finding_id }}",
+        "misconfig_type": "{{ $exec.rule_id == '100090' ? 'PUBLIC_S3' : $exec.rule_id == '100091' ? 'OPEN_SECURITY_GROUP' : $exec.rule_id == '100092' ? 'ROOT_ACCOUNT' : $exec.rule_id == '100093' ? 'AZURE_NSG_OPEN' : $exec.rule_id == '100094' ? 'GUARDDUTY_FINDING' : 'IAM_ESCALATION' }}",
+        "root_fast_track": "{{ $exec.artifacts.is_root == true and variables.ROOT_ACCOUNT_AUTO_REMEDIATE == true }}",
+        "public_s3_fast_track": "{{ $exec.rule_id == '100090' and variables.PUBLIC_S3_AUTO_REMEDIATE == true }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_fast_track_gate",
+      "name": "Critical Misconfiguration Fast-Track Gate",
+      "type": "condition",
+      "description": "Root account usage and public S3 buckets bypass full enrichment and trigger immediate remediation. Both represent zero-tolerance conditions — root account should never be used operationally, and a public S3 bucket is an active data exposure event.",
+      "condition": "{{ $node_02_extract.root_fast_track == true or $node_02_extract.public_s3_fast_track == true }}",
+      "true_branch": "node_10_auto_remediate",
+      "false_branch": "node_04_resource_context",
+      "depends_on": ["node_02_extract"]
+    },
+    {
+      "id": "node_04_resource_context",
+      "name": "AWS Config / Azure Resource — Asset Context",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries AWS Config or Azure Resource Manager for full resource metadata — tags (including data classification, owner, environment), creation date, compliance state, and related resource configuration. Tags drive the severity and SLA of the remediation ticket.",
+      "input": {
+        "method": "POST",
+        "url": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'https://config.' + variables.AWS_REGION + '.amazonaws.com/' : 'https://management.azure.com/subscriptions/' + variables.AZURE_SUBSCRIPTION_ID + '/resources?api-version=2021-04-01&$filter=resourceId eq \\'' + $node_02_extract.resource_arn + '\\'' }}",
+        "headers": {
+          "Authorization": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'AWS4-HMAC-SHA256 Credential=' + variables.AWS_ACCESS_KEY_ID : 'Bearer ' + secrets.AZURE_BEARER_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": "{{ $node_02_extract.cloud_provider == 'AWS' ? '{\"ResourceKeys\": [{\"resourceType\": \"' + $node_02_extract.resource_type + '\", \"resourceId\": \"' + $node_02_extract.resource_id + '\"}]}' : '' }}"
+      },
+      "output_variables": {
+        "resource_name": "{{ $result.configurationItems[0].resourceName | default($result.value[0].name) }}",
+        "resource_tags": "{{ $result.configurationItems[0].tags | default($result.value[0].tags) }}",
+        "resource_owner": "{{ $result.configurationItems[0].tags.Owner | default($result.value[0].tags.Owner) | default('Unknown') }}",
+        "resource_env": "{{ $result.configurationItems[0].tags.Environment | default($result.value[0].tags.Environment) | default('Unknown') }}",
+        "resource_data_class": "{{ $result.configurationItems[0].tags.DataClassification | default($result.value[0].tags.DataClassification) | default('Unclassified') }}",
+        "resource_compliance": "{{ $result.configurationItems[0].configurationItemStatus | default('Unknown') }}",
+        "is_production": "{{ $result.configurationItems[0].tags.Environment | default($result.value[0].tags.Environment) | lower | contains('prod') }}",
+        "is_sensitive_data": "{{ $result.configurationItems[0].tags.DataClassification | default('') | contains('Confidential') or $result.configurationItems[0].tags.DataClassification | default('') | contains('PII') or $result.configurationItems[0].tags.DataClassification | default('') | contains('PHI') }}"
+      },
+      "depends_on": ["node_03_fast_track_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_iam_context",
+      "name": "AWS IAM / Azure AD — Actor Identity Context",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries IAM to get full context on who made the misconfiguration — their role, attached policies, group memberships, and MFA status. Determines whether this was an authorized change, an accident, or a compromised/malicious actor.",
+      "input": {
+        "method": "GET",
+        "url": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'https://iam.amazonaws.com/?Action=GetUser&UserName=' + $node_02_extract.actor_username + '&Version=2010-05-08' : 'https://graph.microsoft.com/v1.0/users/' + $node_02_extract.actor_username }}",
+        "headers": {
+          "Authorization": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'AWS4-HMAC-SHA256 Credential=' + variables.AWS_ACCESS_KEY_ID : 'Bearer ' + secrets.AZURE_GRAPH_TOKEN }}",
+          "Content-Type": "application/json"
+        }
+      },
+      "output_variables": {
+        "actor_display_name": "{{ $result.GetUserResponse.GetUserResult.User.UserName | default($result.displayName) }}",
+        "actor_created": "{{ $result.GetUserResponse.GetUserResult.User.CreateDate | default($result.createdDateTime) }}",
+        "actor_mfa_enabled": "{{ $result.GetUserResponse.GetUserResult.User.VirtualMFADevices | length > 0 | default(false) }}",
+        "actor_policies": "{{ $result.GetUserResponse.GetUserResult.User.AttachedManagedPolicies | map('PolicyName') | default([]) }}",
+        "actor_is_human": "{{ $node_02_extract.actor_type == 'IAMUser' or $node_02_extract.actor_type == 'Root' }}",
+        "actor_is_service": "{{ $node_02_extract.actor_type == 'AssumedRole' or $node_02_extract.actor_type == 'Service' }}",
+        "actor_no_mfa": "{{ not ($result.GetUserResponse.GetUserResult.User.VirtualMFADevices | length > 0) }}"
+      },
+      "depends_on": ["node_03_fast_track_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_exposure_assessment",
+      "name": "Network Exposure Assessment",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Determines the blast radius of the misconfiguration. Public S3 with PII data = maximum exposure. Open security group on RDP port 3389 on production DB server = critical. Combines resource sensitivity, environment classification, and misconfiguration type.",
+      "input": {
+        "formula": {
+          "exposure_score": "({{ $node_04_resource_context.is_production }} == true ? 30 : 10) + ({{ $node_04_resource_context.is_sensitive_data }} == true ? 25 : 0) + ({{ $node_02_extract.misconfig_type }} == 'PUBLIC_S3' ? 20 : {{ $node_02_extract.misconfig_type }} == 'ROOT_ACCOUNT' ? 20 : {{ $node_02_extract.misconfig_type }} == 'OPEN_SECURITY_GROUP' ? 15 : {{ $node_02_extract.misconfig_type }} == 'IAM_ESCALATION' ? 15 : 10) + ({{ $node_05_iam_context.actor_no_mfa }} == true ? 10 : 0) + ({{ $node_02_extract.finding_severity }} >= 7.0 ? 15 : {{ $node_02_extract.finding_severity }} >= 4.0 ? 8 : 0)",
+          "exposure_level": "AUTO_SET"
+        }
+      },
+      "output_variables": {
+        "exposure_score": "{{ $result.exposure_score }}",
+        "exposure_level": "{{ $result.exposure_score >= 80 ? 'CRITICAL' : $result.exposure_score >= 60 ? 'HIGH' : $result.exposure_score >= 40 ? 'MEDIUM' : 'LOW' }}"
+      },
+      "depends_on": ["node_04_resource_context", "node_05_iam_context"]
+    },
+    {
+      "id": "node_07_similar_misconfigs",
+      "name": "AWS Config / Azure — Scan for Similar Misconfigurations",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries AWS Config Rules or Azure Policy to find other resources with the same type of misconfiguration. A single open security group might be an accident. Ten open security groups is a systemic problem. Scope drives the remediation priority.",
+      "input": {
+        "method": "POST",
+        "url": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'https://config.' + variables.AWS_REGION + '.amazonaws.com/' : 'https://management.azure.com/subscriptions/' + variables.AZURE_SUBSCRIPTION_ID + '/providers/Microsoft.PolicyInsights/policyStates/latest/queryResults?api-version=2019-10-01' }}",
+        "headers": {
+          "Authorization": "{{ $node_02_extract.cloud_provider == 'AWS' ? 'AWS4-HMAC-SHA256 Credential=' + variables.AWS_ACCESS_KEY_ID : 'Bearer ' + secrets.AZURE_BEARER_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": "{{ $node_02_extract.cloud_provider == 'AWS' ? '{\"ConfigRuleName\": \"' + $node_02_extract.misconfig_type | lower | replace('_', '-') + '\"}' : '{\"$filter\": \"ComplianceState eq NonCompliant and PolicyDefinitionId eq \\'' + $node_02_extract.misconfig_type + '\\'\"}'  }}"
+      },
+      "output_variables": {
+        "similar_misconfig_count": "{{ $result.EvaluationResults | length | default($result.value | length) | default(0) }}",
+        "similar_resources": "{{ $result.EvaluationResults | map('EvaluationResultIdentifier.EvaluationResultQualifier.ResourceId') | default($result.value | map('resourceId')) | default([]) }}",
+        "is_systemic": "{{ ($result.EvaluationResults | length | default($result.value | length)) > 3 }}"
+      },
+      "depends_on": ["node_04_resource_context"]
+    },
+    {
+      "id": "node_08_score",
+      "name": "Misconfiguration Risk Score",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Combines exposure score with systemic spread and GuardDuty severity into final risk score. Systemic misconfigurations across multiple resources get elevated — they indicate a process failure, not a one-off accident.",
+      "input": {
+        "formula": "{{ $node_06_exposure_assessment.exposure_score }} + ({{ $node_07_similar_misconfigs.is_systemic }} == true ? 15 : 0) + ({{ $node_02_extract.finding_severity }} >= 9.0 ? 10 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_06_exposure_assessment", "node_07_similar_misconfigs"]
+    },
+    {
+      "id": "node_09_decision",
+      "name": "Auto-Remediation Decision Gate",
+      "type": "condition",
+      "description": "Routes to auto-remediation if score >= 65. Lower-confidence findings (non-production resources, no sensitive data tags, low GuardDuty severity) route to Jira ticket creation only — analyst decides on remediation approach.",
+      "condition": "{{ $node_08_score.composite_score >= variables.THREAT_SCORE_THRESHOLD }}",
+      "true_branch": "node_10_auto_remediate",
+      "false_branch": "node_11_create_jira",
+      "depends_on": ["node_08_score"]
+    },
+    {
+      "id": "node_10_auto_remediate",
+      "name": "Auto-Remediation — Revoke Misconfiguration",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Executes the appropriate AWS/Azure API call to remediate the misconfiguration. Action depends on misconfig_type: PUBLIC_S3 → set bucket ACL to private, OPEN_SECURITY_GROUP → revoke 0.0.0.0/0 ingress rule, ROOT_ACCOUNT → revoke root access keys, IAM_ESCALATION → detach over-privileged policy.",
+      "input": {
+        "method": "{{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? 'PUT' : 'DELETE' }}",
+        "url": "{{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? 'https://s3.' + variables.AWS_REGION + '.amazonaws.com/' + $node_02_extract.bucket_name + '?acl' : $node_02_extract.misconfig_type == 'OPEN_SECURITY_GROUP' ? 'https://ec2.' + variables.AWS_REGION + '.amazonaws.com/?Action=RevokeSecurityGroupIngress&GroupId=' + $node_02_extract.resource_id + '&IpPermissions.1.IpProtocol=tcp&IpPermissions.1.FromPort=' + $node_02_extract.affected_port + '&IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0/0' : $node_02_extract.misconfig_type == 'IAM_ESCALATION' ? 'https://iam.amazonaws.com/?Action=DetachUserPolicy&UserName=' + $node_02_extract.actor_username + '&PolicyArn=' + $node_02_extract.policy_arn : 'https://iam.amazonaws.com/?Action=DeleteAccessKey&UserName=root&AccessKeyId=' + $node_02_extract.resource_id }}",
+        "headers": {
+          "Authorization": "AWS4-HMAC-SHA256 Credential={{ variables.AWS_ACCESS_KEY_ID }}",
+          "Content-Type": "{{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? 'application/xml' : 'application/json' }}"
+        },
+        "body": "{{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? '<AccessControlPolicy><Owner><ID>canonical-user-id</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>canonical-user-id</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>' : '' }}"
+      },
+      "output_variables": {
+        "remediation_status": "{{ $result.status | default('executed') }}",
+        "remediation_action": "{{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? 'S3 bucket ACL set to private' : $node_02_extract.misconfig_type == 'OPEN_SECURITY_GROUP' ? 'Security group ingress rule 0.0.0.0/0 revoked' : $node_02_extract.misconfig_type == 'IAM_ESCALATION' ? 'Over-privileged IAM policy detached' : 'Root access key deleted' }}"
+      },
+      "depends_on": ["node_03_fast_track_gate", "node_09_decision"]
+    },
+    {
+      "id": "node_11_create_jira",
+      "name": "Jira — Create Cloud Remediation Ticket",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Creates a structured Jira cloud security remediation ticket. Assigns to the resource owner identified from tags. Includes full context, exposure assessment, similar misconfiguration count, and step-by-step remediation instructions.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.JIRA_URL }}/rest/api/3/issue",
+        "headers": {
+          "Authorization": "Bearer {{ variables.JIRA_API_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "fields": {
+            "project": { "key": "{{ variables.JIRA_CLOUD_PROJECT_KEY }}" },
+            "summary": "[{{ $node_06_exposure_assessment.exposure_level }}] {{ $node_02_extract.misconfig_type | replace('_', ' ') }} — {{ $node_04_resource_context.resource_name }} ({{ $node_02_extract.cloud_provider }}/{{ $node_02_extract.region }})",
+            "issuetype": { "name": "Cloud Security Finding" },
+            "priority": { "name": "{{ $node_06_exposure_assessment.exposure_level == 'CRITICAL' ? 'Highest' : $node_06_exposure_assessment.exposure_level == 'HIGH' ? 'High' : 'Medium' }}" },
+            "labels": ["cloud-security", "pb10", "{{ $node_02_extract.cloud_provider | lower }}", "{{ $node_02_extract.misconfig_type | lower }}", "{{ $node_04_resource_context.resource_env | lower }}"],
+            "description": {
+              "type": "doc",
+              "version": 1,
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [{ "type": "text", "text": "Cloud Misconfiguration Finding — PB-10\n\nProvider: {{ $node_02_extract.cloud_provider }}\nAccount/Subscription: {{ $node_02_extract.account_id }}\nRegion: {{ $node_02_extract.region }}\nMisconfiguration Type: {{ $node_02_extract.misconfig_type }}\nExposure Level: {{ $node_06_exposure_assessment.exposure_level }}\nRisk Score: {{ $node_08_score.composite_score }} / 100\nAuto-Remediated: {{ $node_10_auto_remediate.remediation_action | default('No') }}\n\nAffected Resource\nResource Type: {{ $node_02_extract.resource_type }}\nResource ID: {{ $node_02_extract.resource_id }}\nResource Name: {{ $node_04_resource_context.resource_name }}\nEnvironment: {{ $node_04_resource_context.resource_env }}\nOwner Tag: {{ $node_04_resource_context.resource_owner }}\nData Classification: {{ $node_04_resource_context.resource_data_class }}\nProduction: {{ $node_04_resource_context.is_production }}\nSensitive Data: {{ $node_04_resource_context.is_sensitive_data }}\n\nActor Who Made the Change\nActor: {{ $node_02_extract.actor_username }} ({{ $node_02_extract.actor_type }})\nActor ARN: {{ $node_02_extract.actor_arn }}\nSource IP: {{ $node_02_extract.source_ip }}\nMFA Enabled: {{ $node_05_iam_context.actor_mfa_enabled }}\n\nScope Assessment\nSimilar Misconfigurations Found: {{ $node_07_similar_misconfigs.similar_misconfig_count }}\nIs Systemic Issue: {{ $node_07_similar_misconfigs.is_systemic }}\nAffected Resources: {{ $node_07_similar_misconfigs.similar_resources | join(', ') }}\n\nRemediation Steps\n1. Review the misconfiguration in {{ $node_02_extract.cloud_provider }} console\n2. Verify the change was intentional by contacting the actor: {{ $node_02_extract.actor_username }}\n3. Apply fix: {{ $node_02_extract.misconfig_type == 'PUBLIC_S3' ? 'Set S3 bucket ' + $node_02_extract.bucket_name + ' ACL to Private and review bucket policy' : $node_02_extract.misconfig_type == 'OPEN_SECURITY_GROUP' ? 'Remove 0.0.0.0/0 ingress rule on port ' + $node_02_extract.affected_port + ' from security group ' + $node_02_extract.resource_id : $node_02_extract.misconfig_type == 'IAM_ESCALATION' ? 'Detach ' + $node_02_extract.policy_arn + ' from user and apply least-privilege role boundary' : 'Review IAM changes and remediate per security policy' }}\n4. If systemic — review all {{ $node_07_similar_misconfigs.similar_misconfig_count }} affected resources\n5. Enable AWS Config rule or Azure Policy to prevent recurrence\n6. Rescan resource after fix and close ticket with evidence" }]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "output_variables": {
+        "jira_ticket_key": "{{ $result.key }}",
+        "jira_ticket_url": "{{ variables.JIRA_URL }}/browse/{{ $result.key }}"
+      },
+      "depends_on": ["node_09_decision", "node_10_auto_remediate"]
+    },
+    {
+      "id": "node_12_thehive",
+      "name": "TheHive — Create Case for Critical Cloud Findings",
+      "type": "condition_action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a TheHive case only for critical-exposure cloud findings — production resources with sensitive data, root account usage, and GuardDuty high-severity findings. Routine misconfigurations on non-production resources are tracked in Jira only.",
+      "condition": "{{ $node_06_exposure_assessment.exposure_level == 'CRITICAL' or $node_02_extract.is_root == true or $node_02_extract.finding_severity >= 7.0 }}",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-10 | Cloud {{ $node_06_exposure_assessment.exposure_level }} — {{ $node_02_extract.misconfig_type | replace('_', ' ') }} | {{ $node_04_resource_context.resource_name }} | Score: {{ $node_08_score.composite_score }}",
+        "severity": "{{ $node_06_exposure_assessment.exposure_level == 'CRITICAL' ? 3 : 2 }}",
+        "tags": ["cloud", "pb10", "{{ $node_02_extract.cloud_provider | lower }}", "{{ $node_02_extract.misconfig_type | lower }}", "{{ $node_06_exposure_assessment.exposure_level | lower }}"],
+        "description": "## Cloud Misconfiguration — Critical Finding\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Provider:** {{ $node_02_extract.cloud_provider }}\n**Misconfiguration:** {{ $node_02_extract.misconfig_type }}\n**Exposure Level:** {{ $node_06_exposure_assessment.exposure_level }}\n**Risk Score:** {{ $node_08_score.composite_score }} / 100\n**Auto-Remediated:** {{ $node_10_auto_remediate.remediation_action | default('No — see Jira ticket') }}\n**Jira Ticket:** {{ $node_11_create_jira.jira_ticket_url }}\n\n### Affected Resource\n| Field | Value |\n|---|---|\n| Provider | {{ $node_02_extract.cloud_provider }} |\n| Account/Subscription | {{ $node_02_extract.account_id }} |\n| Region | {{ $node_02_extract.region }} |\n| Resource Type | {{ $node_02_extract.resource_type }} |\n| Resource ID | {{ $node_02_extract.resource_id }} |\n| Resource Name | {{ $node_04_resource_context.resource_name }} |\n| Environment | {{ $node_04_resource_context.resource_env }} |\n| Owner | {{ $node_04_resource_context.resource_owner }} |\n| Data Classification | {{ $node_04_resource_context.resource_data_class }} |\n| Production | {{ $node_04_resource_context.is_production }} |\n| Sensitive Data Tags | {{ $node_04_resource_context.is_sensitive_data }} |\n\n### Actor\n| Field | Value |\n|---|---|\n| Username | {{ $node_02_extract.actor_username }} |\n| Actor Type | {{ $node_02_extract.actor_type }} |\n| ARN | {{ $node_02_extract.actor_arn }} |\n| Source IP | {{ $node_02_extract.source_ip }} |\n| MFA Enabled | {{ $node_05_iam_context.actor_mfa_enabled }} |\n| Attached Policies | {{ $node_05_iam_context.actor_policies | join(', ') }} |\n\n### Exposure Assessment\n| Field | Value |\n|---|---|\n| Exposure Score | {{ $node_06_exposure_assessment.exposure_score }} |\n| Exposure Level | {{ $node_06_exposure_assessment.exposure_level }} |\n| GuardDuty Severity | {{ $node_02_extract.finding_severity }} |\n\n### Scope\n| Field | Value |\n|---|---|\n| Similar Misconfigurations | {{ $node_07_similar_misconfigs.similar_misconfig_count }} |\n| Systemic Issue | {{ $node_07_similar_misconfigs.is_systemic }} |\n| Other Affected Resources | {{ $node_07_similar_misconfigs.similar_resources | join(', ') }} |\n\n### Auto-Remediation\n| Action | Status |\n|---|---|\n| Remediation Action | {{ $node_10_auto_remediate.remediation_action | default('Not auto-remediated') }} |\n| Status | {{ $node_10_auto_remediate.remediation_status | default('Pending manual remediation') }} |\n\n### Investigation Checklist\n- [ ] Confirm auto-remediation applied correctly — verify in AWS/Azure console\n- [ ] Contact actor {{ $node_02_extract.actor_username }} to determine if change was intentional\n- [ ] If GuardDuty finding — review full finding detail in GuardDuty console for threat context\n- [ ] Check CloudTrail/Activity Log for other actions by the same actor in the past 24 hours\n- [ ] If root account used — verify root access keys are deleted and root MFA is enabled\n- [ ] Review all {{ $node_07_similar_misconfigs.similar_misconfig_count }} similar misconfigurations for systemic remediation\n- [ ] Enable AWS Config rule / Azure Policy to prevent recurrence of this misconfiguration type\n- [ ] Review resource data classification tags — ensure sensitive buckets/DBs are correctly tagged\n- [ ] Verify Jira remediation ticket assigned to correct owner: {{ $node_04_resource_context.resource_owner }}",
+        "observables": [
+          { "dataType": "other", "data": "{{ $node_02_extract.resource_arn | default($node_02_extract.resource_id) }}", "message": "Misconfigured resource ARN/ID" },
+          { "dataType": "ip", "data": "{{ $node_02_extract.source_ip }}", "message": "Actor source IP" },
+          { "dataType": "username", "data": "{{ $node_02_extract.actor_username }}", "message": "Actor who made the change" },
+          { "dataType": "other", "data": "{{ $node_02_extract.cloud_provider }}/{{ $node_02_extract.account_id }}/{{ $node_02_extract.region }}", "message": "Cloud account context" }
+        ]
+      },
+      "depends_on": ["node_11_create_jira"]
+    },
+    {
+      "id": "node_13_notify",
+      "name": "Slack — Cloud Security Alert",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts structured cloud security alert to the cloud security channel. Root account and critical exposure findings get elevated messaging.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "channel": "{{ variables.SLACK_CLOUD_CHANNEL }}",
+          "text": "*PB-10 | Cloud {{ $node_06_exposure_assessment.exposure_level }} Finding{{ $node_02_extract.is_root == true ? ' — :rotating_light: ROOT ACCOUNT USED' : '' }}{{ $node_04_resource_context.is_sensitive_data == true ? ' — SENSITIVE DATA EXPOSED' : '' }}*",
+          "attachments": [
+            {
+              "color": "{{ $node_06_exposure_assessment.exposure_level == 'CRITICAL' ? '#E24B4A' : $node_06_exposure_assessment.exposure_level == 'HIGH' ? '#EF9F27' : '#378ADD' }}",
+              "fields": [
+                { "title": "Risk Score", "value": "{{ $node_08_score.composite_score }} / 100", "short": true },
+                { "title": "Action", "value": "{{ $node_10_auto_remediate.remediation_action | default('Jira ticket created') }}", "short": true },
+                { "title": "Misconfiguration", "value": "{{ $node_02_extract.misconfig_type | replace('_', ' ') }}", "short": true },
+                { "title": "Exposure Level", "value": "{{ $node_06_exposure_assessment.exposure_level }}", "short": true },
+                { "title": "Provider / Region", "value": "{{ $node_02_extract.cloud_provider }} / {{ $node_02_extract.region }}", "short": true },
+                { "title": "Resource", "value": "{{ $node_04_resource_context.resource_name }} ({{ $node_02_extract.resource_type }})", "short": true },
+                { "title": "Environment", "value": "{{ $node_04_resource_context.resource_env }}", "short": true },
+                { "title": "Sensitive Data", "value": "{{ $node_04_resource_context.is_sensitive_data }} — {{ $node_04_resource_context.resource_data_class }}", "short": true },
+                { "title": "Actor", "value": "{{ $node_02_extract.actor_username }} ({{ $node_02_extract.actor_type }})", "short": true },
+                { "title": "Similar Misconfigs", "value": "{{ $node_07_similar_misconfigs.similar_misconfig_count }} found", "short": true },
+                { "title": "Jira Ticket", "value": "{{ $node_11_create_jira.jira_ticket_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_12_thehive"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    "node_03_fast_track_gate",
+    ["node_04_resource_context", "node_05_iam_context"],
+    "node_06_exposure_assessment",
+    ["node_07_similar_misconfigs", "node_08_score"],
+    "node_09_decision",
+    "node_10_auto_remediate",
+    "node_11_create_jira",
+    "node_12_thehive",
+    "node_13_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Initial Access", "technique": "T1190", "name": "Exploit Public-Facing Application" },
+    { "tactic": "Defense Evasion", "technique": "T1578", "name": "Modify Cloud Compute Infrastructure" },
+    { "tactic": "Privilege Escalation", "technique": "T1548", "name": "Abuse Elevation Control Mechanism" },
+    { "tactic": "Exfiltration", "technique": "T1530", "name": "Data from Cloud Storage" },
+    { "tactic": "Persistence", "technique": "T1136", "subtechnique": "T1136.003", "name": "Create Account: Cloud Account" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — CloudTrail events stream to Wazuh and webhook immediately on API call",
+    "estimated_mttr_reduction": "S3 ACL revoked, SG rule removed in < 5 seconds for fast-track path vs. hours of manual remediation",
+    "key_differentiator": "Resource tag-driven severity — DataClassification and Environment tags gate auto-remediation vs. Jira-only response"
+  }
+}

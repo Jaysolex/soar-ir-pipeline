@@ -1,0 +1,386 @@
+{
+  "id": "pb05-impossible-travel-v1",
+  "name": "PB-05 | Impossible Travel & Suspicious Login Detection",
+  "description": "Production playbook. Ingests geographic authentication anomalies, Azure AD risky sign-in events, Tor-based logins, and impossible travel indicators from Wazuh and Azure AD Identity Protection. Enriches via MaxMind GeoIP, AbuseIPDB, and Active Directory user context. Calculates travel velocity between login locations. Routes to automated session revocation and MFA step-up, or analyst escalation.",
+  "tags": ["impossible-travel", "geo-anomaly", "identity", "authentication", "azure-ad", "pb05"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_impossible_travel_05",
+    "description": "Listens for Wazuh authentication anomaly and Azure AD Identity Protection alerts on rule group: impossible_travel,pb05 at level >= 11"
+  },
+  "variables": {
+    "ABUSEIPDB_API_KEY": "{{ secrets.ABUSEIPDB_API_KEY }}",
+    "MAXMIND_LICENSE_KEY": "{{ secrets.MAXMIND_LICENSE_KEY }}",
+    "M365_TENANT_ID": "{{ secrets.M365_TENANT_ID }}",
+    "M365_CLIENT_ID": "{{ secrets.M365_CLIENT_ID }}",
+    "M365_CLIENT_SECRET": "{{ secrets.M365_CLIENT_SECRET }}",
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "HOME_COUNTRY": "CA",
+    "HOME_CITY": "Toronto",
+    "HOME_LAT": 43.6532,
+    "HOME_LON": -79.3832,
+    "MAX_TRAVEL_SPEED_KMH": 900,
+    "THREAT_SCORE_THRESHOLD": 65,
+    "TOR_AUTO_REVOKE": true
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives Wazuh or Azure AD Identity Protection authentication anomaly payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "source": "string",
+        "artifacts": {
+          "username": "string",
+          "upn": "string",
+          "source_ip": "string",
+          "previous_ip": "string",
+          "current_login_time": "string",
+          "previous_login_time": "string",
+          "device_id": "string",
+          "is_new_device": "boolean",
+          "is_tor": "boolean",
+          "risk_level": "string",
+          "risk_detail": "string",
+          "application": "string",
+          "country_code": "string"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Pre-Flags",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes login event fields. Pre-flags Tor logins for zero-tolerance fast-track and extracts both current and previous IP for travel velocity calculation.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "username": "{{ $exec.artifacts.username }}",
+        "upn": "{{ $exec.artifacts.upn }}",
+        "source_ip": "{{ $exec.artifacts.source_ip }}",
+        "previous_ip": "{{ $exec.artifacts.previous_ip }}",
+        "current_login_time": "{{ $exec.artifacts.current_login_time }}",
+        "previous_login_time": "{{ $exec.artifacts.previous_login_time }}",
+        "device_id": "{{ $exec.artifacts.device_id }}",
+        "is_new_device": "{{ $exec.artifacts.is_new_device }}",
+        "is_tor": "{{ $exec.artifacts.is_tor }}",
+        "risk_level": "{{ $exec.artifacts.risk_level }}",
+        "application": "{{ $exec.artifacts.application }}",
+        "tor_fast_track": "{{ $exec.artifacts.is_tor == true and variables.TOR_AUTO_REVOKE == true }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_tor_gate",
+      "name": "Tor / Anonymizer Zero-Tolerance Gate",
+      "type": "condition",
+      "description": "Tor-based logins bypass enrichment and scoring. Authentication via anonymizing infrastructure has no legitimate corporate use case and is an immediate session revocation trigger.",
+      "condition": "{{ $node_02_extract.tor_fast_track == true }}",
+      "true_branch": "node_09_revoke_sessions",
+      "false_branch": "node_04_geoip_current",
+      "depends_on": ["node_02_extract"]
+    },
+    {
+      "id": "node_04_geoip_current",
+      "name": "MaxMind GeoIP — Resolve Current Login IP",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Resolves current login source IP to geographic coordinates, country, city, and ASN. Used for travel velocity calculation and anomaly scoring.",
+      "input": {
+        "method": "GET",
+        "url": "https://geolite.info/geoip/v2.1/city/{{ $node_02_extract.source_ip }}",
+        "headers": {
+          "Authorization": "Basic {{ variables.MAXMIND_LICENSE_KEY | base64encode }}"
+        }
+      },
+      "output_variables": {
+        "current_country": "{{ $result.country.iso_code }}",
+        "current_city": "{{ $result.city.names.en }}",
+        "current_lat": "{{ $result.location.latitude }}",
+        "current_lon": "{{ $result.location.longitude }}",
+        "current_asn": "{{ $result.traits.autonomous_system_organization }}",
+        "current_is_hosting": "{{ $result.traits.is_hosting_provider }}",
+        "current_is_vpn": "{{ $result.traits.is_anonymous_vpn }}"
+      },
+      "depends_on": ["node_03_tor_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_geoip_previous",
+      "name": "MaxMind GeoIP — Resolve Previous Login IP",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Resolves previous login IP to coordinates. Combined with current IP coordinates and login timestamps, calculates whether physical travel between the two locations is humanly possible.",
+      "input": {
+        "method": "GET",
+        "url": "https://geolite.info/geoip/v2.1/city/{{ $node_02_extract.previous_ip }}",
+        "headers": {
+          "Authorization": "Basic {{ variables.MAXMIND_LICENSE_KEY | base64encode }}"
+        }
+      },
+      "output_variables": {
+        "previous_country": "{{ $result.country.iso_code }}",
+        "previous_city": "{{ $result.city.names.en }}",
+        "previous_lat": "{{ $result.location.latitude }}",
+        "previous_lon": "{{ $result.location.longitude }}"
+      },
+      "depends_on": ["node_03_tor_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_abuseipdb",
+      "name": "AbuseIPDB — Source IP Reputation",
+      "type": "action",
+      "app": "AbuseIPDB",
+      "action": "check_ip",
+      "description": "Validates source IP against AbuseIPDB. High abuse score on a login source IP confirms malicious infrastructure vs. legitimate travel.",
+      "input": {
+        "apikey": "{{ variables.ABUSEIPDB_API_KEY }}",
+        "ipAddress": "{{ $node_02_extract.source_ip }}",
+        "maxAgeInDays": 30
+      },
+      "output_variables": {
+        "ip_abuse_score": "{{ $result.data.abuseConfidenceScore }}",
+        "ip_isp": "{{ $result.data.isp }}",
+        "ip_usage_type": "{{ $result.data.usageType }}",
+        "ip_total_reports": "{{ $result.data.totalReports }}",
+        "ip_is_tor": "{{ $result.data.isTor }}"
+      },
+      "depends_on": ["node_03_tor_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_07_ad_context",
+      "name": "Active Directory — User Context & Travel History",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "get_user",
+      "description": "Pulls AD user context: privilege level, department, known travel patterns from extensionAttribute, VIP flag, and last known login location for baseline comparison.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.username }}"
+      },
+      "output_variables": {
+        "user_display_name": "{{ $result.displayName }}",
+        "user_department": "{{ $result.department }}",
+        "user_job_title": "{{ $result.jobTitle }}",
+        "user_manager": "{{ $result.manager }}",
+        "user_groups": "{{ $result.memberOf }}",
+        "user_last_login": "{{ $result.lastLogon }}",
+        "user_known_locations": "{{ $result.extensionAttribute1 }}",
+        "is_privileged": "{{ $result.memberOf | contains('Domain Admins') or $result.memberOf | contains('Global Admins') }}",
+        "is_vip": "{{ $result.memberOf | contains('Executive') or $result.memberOf | contains('VIP') }}",
+        "is_frequent_traveler": "{{ $result.extensionAttribute2 == 'frequent_traveler' }}"
+      },
+      "depends_on": ["node_03_tor_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_08_velocity_calc",
+      "name": "Travel Velocity Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Calculates the haversine distance between previous and current login coordinates. Divides by time delta between logins to get required travel speed in km/h. Flags as impossible if speed exceeds 900 km/h (commercial aircraft cruising speed).",
+      "input": {
+        "formula": {
+          "distance_km": "haversine({{ $node_05_geoip_previous.previous_lat }}, {{ $node_05_geoip_previous.previous_lon }}, {{ $node_04_geoip_current.current_lat }}, {{ $node_04_geoip_current.current_lon }})",
+          "time_delta_hours": "(timestamp_to_epoch('{{ $node_02_extract.current_login_time }}') - timestamp_to_epoch('{{ $node_02_extract.previous_login_time }}')) / 3600",
+          "required_speed_kmh": "distance_km / time_delta_hours",
+          "is_impossible": "required_speed_kmh > {{ variables.MAX_TRAVEL_SPEED_KMH }}"
+        }
+      },
+      "output_variables": {
+        "distance_km": "{{ $result.distance_km | round(0) }}",
+        "time_delta_hours": "{{ $result.time_delta_hours | round(2) }}",
+        "required_speed_kmh": "{{ $result.required_speed_kmh | round(0) }}",
+        "is_impossible_travel": "{{ $result.is_impossible }}"
+      },
+      "depends_on": ["node_04_geoip_current", "node_05_geoip_previous"]
+    },
+    {
+      "id": "node_08b_score",
+      "name": "Composite Threat Score Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Weights impossible travel confirmation, IP abuse score, hosting/VPN provider flags, new device, privileged account, and Azure AD risk level into composite score.",
+      "input": {
+        "formula": "({{ $node_08_velocity_calc.is_impossible_travel }} == true ? 35 : 0) + ({{ $node_06_abuseipdb.ip_abuse_score }} * 0.25) + ({{ $node_04_geoip_current.current_is_hosting }} == true ? 10 : 0) + ({{ $node_04_geoip_current.current_is_vpn }} == true ? 10 : 0) + ({{ $node_02_extract.is_new_device }} == true ? 10 : 0) + ({{ $node_07_ad_context.is_privileged }} == true ? 10 : 0) + ({{ $node_02_extract.risk_level }} == 'high' ? 20 : {{ $node_02_extract.risk_level }} == 'medium' ? 10 : 0) - ({{ $node_07_ad_context.is_frequent_traveler }} == true ? 15 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_08_velocity_calc", "node_06_abuseipdb", "node_07_ad_context"]
+    },
+    {
+      "id": "node_08c_decision",
+      "name": "Threat Score Decision Gate",
+      "type": "condition",
+      "description": "Routes to automated session revocation and MFA step-up if score >= 65. Frequent travelers with no other risk signals route to analyst review to prevent false positives on legitimate travel.",
+      "condition": "{{ $node_08b_score.composite_score >= variables.THREAT_SCORE_THRESHOLD }}",
+      "true_branch": "node_09_revoke_sessions",
+      "false_branch": "node_12_escalate",
+      "depends_on": ["node_08b_score"]
+    },
+    {
+      "id": "node_09_revoke_sessions",
+      "name": "Azure AD — Revoke All Active Sessions",
+      "type": "action",
+      "app": "Microsoft Azure AD",
+      "action": "revoke_sign_in_sessions",
+      "description": "Revokes all active sign-in sessions and OAuth refresh tokens for the account. Forces re-authentication on all active devices — attacker loses any persistent session they established.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "user_principal_name": "{{ $node_02_extract.upn }}"
+      },
+      "output_variables": {
+        "revocation_status": "{{ $result.status }}",
+        "revocation_timestamp": "{{ $result.timestamp }}"
+      },
+      "depends_on": ["node_03_tor_gate", "node_08c_decision"]
+    },
+    {
+      "id": "node_10_require_mfa",
+      "name": "Azure AD — Enforce MFA Step-Up",
+      "type": "action",
+      "app": "Microsoft Azure AD",
+      "action": "require_mfa",
+      "description": "Sets a conditional access policy on the account requiring MFA on next sign-in attempt. Even if the attacker has valid credentials, they cannot complete authentication without the second factor.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "user_principal_name": "{{ $node_02_extract.upn }}",
+        "action": "require_mfa_next_signin",
+        "reason": "PB-05 | Suspicious login — impossible travel or Tor detection. Score: {{ $node_08b_score.composite_score }}"
+      },
+      "output_variables": {
+        "mfa_enforced": "{{ $result.status }}"
+      },
+      "depends_on": ["node_09_revoke_sessions"],
+      "parallel_group": "post_revoke"
+    },
+    {
+      "id": "node_11_notify_user",
+      "name": "Email — Notify Account Owner",
+      "type": "action",
+      "app": "Microsoft 365",
+      "action": "send_email",
+      "description": "Sends a security notification to the account owner's registered email address informing them of the suspicious login attempt and that their sessions have been revoked. Legitimate users can contact the helpdesk to restore access. This also acts as an out-of-band signal — if the user didn't travel, it confirms account compromise.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "to": "{{ $node_02_extract.upn }}",
+        "subject": "Security Alert — Suspicious Login Detected on Your Account",
+        "body": "Dear {{ $node_07_ad_context.user_display_name }},\n\nOur security system detected a login to your account from an unusual location:\n\n- Location: {{ $node_04_geoip_current.current_city }}, {{ $node_04_geoip_current.current_country }}\n- Time: {{ $node_02_extract.current_login_time }}\n- IP Address: {{ $node_02_extract.source_ip }}\n\nAs a precaution, your active sessions have been terminated and you will be required to verify your identity on your next sign-in.\n\nIf this was you:\n- Simply sign in again and complete MFA verification.\n\nIf this was NOT you:\n- Contact the Security Operations team immediately at security@yourorg.com\n- Do not attempt to reset your password until you have spoken with the SOC team.\n\nThis is an automated security notification.\nSecurity Operations Center"
+      },
+      "depends_on": ["node_09_revoke_sessions"],
+      "parallel_group": "post_revoke"
+    },
+    {
+      "id": "node_12_escalate",
+      "name": "TheHive — Create Identity Incident Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a structured TheHive case with full geo-analysis, travel velocity calculation, enrichment results, and containment actions. Routes to Identity & Access analyst queue.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-05 | Suspicious Login — {{ $node_02_extract.username }} | {{ $node_04_geoip_current.current_city }}, {{ $node_04_geoip_current.current_country }} | Score: {{ $node_08b_score.composite_score }}",
+        "severity": "{{ $node_07_ad_context.is_privileged == true ? 3 : 2 }}",
+        "tags": ["impossible-travel", "pb05", "identity", "geo-anomaly", "{{ $node_08_velocity_calc.is_impossible_travel == true ? 'confirmed-impossible-travel' : 'geo-anomaly' }}", "{{ $node_02_extract.is_tor == true ? 'tor-login' : '' }}"],
+        "description": "## Suspicious Login — Automated Geo-Analysis Output\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule:** {{ $exec.rule_name }}\n**Composite Threat Score:** {{ $node_08b_score.composite_score }} / 100\n**Sessions Revoked:** {{ $node_09_revoke_sessions.revocation_status }}\n**MFA Enforced:** {{ $node_10_require_mfa.mfa_enforced }}\n**User Notified:** Yes\n\n### Login Event\n| Field | Value |\n|---|---|\n| Username | {{ $node_02_extract.username }} |\n| UPN | {{ $node_02_extract.upn }} |\n| Source IP | {{ $node_02_extract.source_ip }} |\n| Application | {{ $node_02_extract.application }} |\n| New Device | {{ $node_02_extract.is_new_device }} |\n| Device ID | {{ $node_02_extract.device_id }} |\n| Azure AD Risk Level | {{ $node_02_extract.risk_level }} |\n| Tor Login | {{ $node_02_extract.is_tor }} |\n\n### Travel Velocity Analysis\n| Field | Value |\n|---|---|\n| Previous Location | {{ $node_05_geoip_previous.previous_city }}, {{ $node_05_geoip_previous.previous_country }} |\n| Previous Login Time | {{ $node_02_extract.previous_login_time }} |\n| Current Location | {{ $node_04_geoip_current.current_city }}, {{ $node_04_geoip_current.current_country }} |\n| Current Login Time | {{ $node_02_extract.current_login_time }} |\n| Distance Between Logins | {{ $node_08_velocity_calc.distance_km }} km |\n| Time Between Logins | {{ $node_08_velocity_calc.time_delta_hours }} hours |\n| Required Travel Speed | {{ $node_08_velocity_calc.required_speed_kmh }} km/h |\n| Impossible Travel | {{ $node_08_velocity_calc.is_impossible_travel }} |\n\n### Current IP Enrichment\n| Source | Finding |\n|---|---|\n| AbuseIPDB | Score: {{ $node_06_abuseipdb.ip_abuse_score }} / 100 · ISP: {{ $node_06_abuseipdb.ip_isp }} · Reports: {{ $node_06_abuseipdb.ip_total_reports }} |\n| MaxMind | Country: {{ $node_04_geoip_current.current_country }} · City: {{ $node_04_geoip_current.current_city }} · ASN: {{ $node_04_geoip_current.current_asn }} |\n| Hosting Provider | {{ $node_04_geoip_current.current_is_hosting }} |\n| Anonymous VPN | {{ $node_04_geoip_current.current_is_vpn }} |\n\n### Account Context\n| Field | Value |\n|---|---|\n| Display Name | {{ $node_07_ad_context.user_display_name }} |\n| Department | {{ $node_07_ad_context.user_department }} |\n| Job Title | {{ $node_07_ad_context.user_job_title }} |\n| Manager | {{ $node_07_ad_context.user_manager }} |\n| Last Known Login | {{ $node_07_ad_context.user_last_login }} |\n| Privileged Account | {{ $node_07_ad_context.is_privileged }} |\n| VIP | {{ $node_07_ad_context.is_vip }} |\n| Frequent Traveler | {{ $node_07_ad_context.is_frequent_traveler }} |\n\n### Containment Actions Taken\n| Action | Status |\n|---|---|\n| Azure AD Sessions Revoked | {{ $node_09_revoke_sessions.revocation_status }} |\n| MFA Step-Up Enforced | {{ $node_10_require_mfa.mfa_enforced }} |\n| User Notified via Email | Sent |\n\n### Analyst Next Steps\n- [ ] Contact account owner's manager ({{ $node_07_ad_context.user_manager }}) to verify travel status\n- [ ] Check if account owner submitted a travel notification to IT\n- [ ] Review sign-in logs for any data access or downloads during the suspicious session\n- [ ] Check M365 audit log for any mail forwarding rules, file shares, or app consents created\n- [ ] If confirmed compromise — initiate full credential reset and review all privileged access\n- [ ] If legitimate travel — whitelist the country in the user's AD extensionAttribute and close case\n- [ ] Check for lateral movement from the suspicious session to other accounts or systems",
+        "observables": [
+          { "dataType": "ip", "data": "{{ $node_02_extract.source_ip }}", "message": "Suspicious login source IP" },
+          { "dataType": "username", "data": "{{ $node_02_extract.username }}", "message": "Target account" },
+          { "dataType": "other", "data": "{{ $node_04_geoip_current.current_country }}", "message": "Login country" },
+          { "dataType": "other", "data": "{{ $node_08_velocity_calc.required_speed_kmh }} km/h required travel speed", "message": "Travel velocity analysis" }
+        ]
+      },
+      "depends_on": ["node_08b_score", "node_10_require_mfa", "node_11_notify_user"]
+    },
+    {
+      "id": "node_13_notify",
+      "name": "Slack — SOC Identity Alert",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts structured alert to SOC channel. Privileged account impossible travel alerts also ping the security manager channel.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "text": "*PB-05 | Suspicious Login{{ $node_08_velocity_calc.is_impossible_travel == true ? ' — IMPOSSIBLE TRAVEL CONFIRMED' : '' }}{{ $node_07_ad_context.is_privileged == true ? ' — :rotating_light: PRIVILEGED ACCOUNT' : '' }}*",
+          "attachments": [
+            {
+              "color": "{{ $node_08b_score.composite_score >= 80 ? '#E24B4A' : $node_08b_score.composite_score >= 65 ? '#EF9F27' : '#378ADD' }}",
+              "fields": [
+                { "title": "Threat Score", "value": "{{ $node_08b_score.composite_score }} / 100", "short": true },
+                { "title": "Action", "value": "{{ $node_08c_decision.result == true ? 'SESSIONS REVOKED + MFA ENFORCED' : 'ESCALATED TO ANALYST' }}", "short": true },
+                { "title": "Account", "value": "{{ $node_02_extract.username }}", "short": true },
+                { "title": "Login From", "value": "{{ $node_04_geoip_current.current_city }}, {{ $node_04_geoip_current.current_country }}", "short": true },
+                { "title": "Previous Login", "value": "{{ $node_05_geoip_previous.previous_city }}, {{ $node_05_geoip_previous.previous_country }}", "short": true },
+                { "title": "Required Speed", "value": "{{ $node_08_velocity_calc.required_speed_kmh }} km/h", "short": true },
+                { "title": "Impossible Travel", "value": "{{ $node_08_velocity_calc.is_impossible_travel }}", "short": true },
+                { "title": "Tor Login", "value": "{{ $node_02_extract.is_tor }}", "short": true },
+                { "title": "IP Abuse Score", "value": "{{ $node_06_abuseipdb.ip_abuse_score }} / 100", "short": true },
+                { "title": "Privileged Account", "value": "{{ $node_07_ad_context.is_privileged }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_12_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_12_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    "node_03_tor_gate",
+    ["node_04_geoip_current", "node_05_geoip_previous", "node_06_abuseipdb", "node_07_ad_context"],
+    "node_08_velocity_calc",
+    "node_08b_score",
+    "node_08c_decision",
+    "node_09_revoke_sessions",
+    ["node_10_require_mfa", "node_11_notify_user"],
+    "node_12_escalate",
+    "node_13_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Initial Access", "technique": "T1078", "subtechnique": "T1078.004", "name": "Valid Accounts: Cloud Accounts" },
+    { "tactic": "Defense Evasion", "technique": "T1090", "subtechnique": "T1090.003", "name": "Proxy: Multi-hop Proxy (Tor)" },
+    { "tactic": "Credential Access", "technique": "T1110", "subtechnique": "T1110.004", "name": "Brute Force: Credential Stuffing" },
+    { "tactic": "Persistence", "technique": "T1078", "name": "Valid Accounts" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — Azure AD Identity Protection events streamed directly to webhook",
+    "estimated_mttr_reduction": "Session revocation in < 5 seconds vs. 20-45 min manual process",
+    "false_positive_mitigation": "Frequent traveler flag in AD extensionAttribute subtracts 15 points from score — reduces false positives on legitimate business travel"
+  }
+}

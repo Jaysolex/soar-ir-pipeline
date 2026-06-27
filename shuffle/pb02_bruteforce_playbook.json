@@ -1,0 +1,323 @@
+{
+  "id": "pb02-bruteforce-lockout-v1",
+  "name": "PB-02 | Brute Force Detection & Automated Account Lockout",
+  "description": "Production playbook. Ingests brute force and credential stuffing alerts from Wazuh. Enriches source IP via AbuseIPDB and MaxMind GeoIP, queries Active Directory for account privilege context, calculates threat score, then routes to automated account lockout and firewall block or analyst escalation.",
+  "tags": ["brute-force", "credential-stuffing", "authentication", "account-lockout", "pb02"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_bruteforce_02",
+    "description": "Listens for JSON payloads from Wazuh on rule group: brute_force,pb02 at level >= 10"
+  },
+  "variables": {
+    "ABUSEIPDB_API_KEY": "{{ secrets.ABUSEIPDB_API_KEY }}",
+    "MAXMIND_LICENSE_KEY": "{{ secrets.MAXMIND_LICENSE_KEY }}",
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "FIREWALL_API_URL": "{{ secrets.FIREWALL_API_URL }}",
+    "FIREWALL_API_KEY": "{{ secrets.FIREWALL_API_KEY }}",
+    "THREAT_SCORE_THRESHOLD": 70,
+    "FAILED_LOGIN_THRESHOLD": 10,
+    "HOME_COUNTRY": "CA"
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives Wazuh brute force alert payload via HTTP POST.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "severity": "string",
+        "artifacts": {
+          "source_ip": "string",
+          "target_username": "string",
+          "target_hostname": "string",
+          "failed_count": "integer",
+          "success_after_fail": "boolean",
+          "event_id": "string",
+          "country_code": "string"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Normalization",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes Wazuh alert fields into discrete pipeline variables for downstream enrichment nodes.",
+      "input": {
+        "raw_payload": "{{ $exec }}",
+        "extract_fields": [
+          "artifacts.source_ip",
+          "artifacts.target_username",
+          "artifacts.target_hostname",
+          "artifacts.failed_count",
+          "artifacts.success_after_fail",
+          "artifacts.event_id",
+          "artifacts.country_code"
+        ]
+      },
+      "output_variables": {
+        "source_ip": "{{ $exec.artifacts.source_ip }}",
+        "target_username": "{{ $exec.artifacts.target_username }}",
+        "target_hostname": "{{ $exec.artifacts.target_hostname }}",
+        "failed_count": "{{ $exec.artifacts.failed_count }}",
+        "success_after_fail": "{{ $exec.artifacts.success_after_fail }}",
+        "event_id": "{{ $exec.artifacts.event_id }}",
+        "country_code": "{{ $exec.artifacts.country_code }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_abuseipdb",
+      "name": "AbuseIPDB — Source IP Reputation",
+      "type": "action",
+      "app": "AbuseIPDB",
+      "action": "check_ip",
+      "description": "Checks source IP abuse confidence score. High score on a brute force source IP confirms automated attack tooling vs. accidental lockout.",
+      "input": {
+        "apikey": "{{ variables.ABUSEIPDB_API_KEY }}",
+        "ipAddress": "{{ $node_02_extract.source_ip }}",
+        "maxAgeInDays": 90
+      },
+      "output_variables": {
+        "ip_abuse_score": "{{ $result.data.abuseConfidenceScore }}",
+        "ip_country": "{{ $result.data.countryCode }}",
+        "ip_isp": "{{ $result.data.isp }}",
+        "ip_total_reports": "{{ $result.data.totalReports }}",
+        "ip_is_tor": "{{ $result.data.isTor }}",
+        "ip_usage_type": "{{ $result.data.usageType }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_04_geoip",
+      "name": "MaxMind GeoIP — Location Anomaly Check",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Resolves source IP to geographic coordinates. Compares against expected home country to flag impossible travel or off-hours foreign access.",
+      "input": {
+        "method": "GET",
+        "url": "https://geolite.info/geoip/v2.1/city/{{ $node_02_extract.source_ip }}",
+        "headers": {
+          "Authorization": "Basic {{ variables.MAXMIND_LICENSE_KEY | base64encode }}"
+        }
+      },
+      "output_variables": {
+        "geo_country": "{{ $result.country.iso_code }}",
+        "geo_city": "{{ $result.city.names.en }}",
+        "geo_latitude": "{{ $result.location.latitude }}",
+        "geo_longitude": "{{ $result.location.longitude }}",
+        "geo_is_anomalous": "{{ $result.country.iso_code != variables.HOME_COUNTRY }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_ad_lookup",
+      "name": "Active Directory — Account Context Query",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "get_user",
+      "description": "Queries AD for the targeted account. Determines privilege level, group memberships, account status, last login, and whether account is a service account or VIP.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.target_username }}"
+      },
+      "output_variables": {
+        "user_display_name": "{{ $result.displayName }}",
+        "user_department": "{{ $result.department }}",
+        "user_job_title": "{{ $result.jobTitle }}",
+        "user_groups": "{{ $result.memberOf }}",
+        "user_last_login": "{{ $result.lastLogon }}",
+        "user_account_status": "{{ $result.userAccountControl }}",
+        "is_privileged": "{{ $result.memberOf | contains('Domain Admins') or $result.memberOf | contains('Enterprise Admins') or $result.memberOf | contains('Schema Admins') }}",
+        "is_service_account": "{{ $result.memberOf | contains('Service Accounts') or $node_02_extract.target_username | startswith('svc_') }}",
+        "is_vip": "{{ $result.memberOf | contains('Executive') or $result.memberOf | contains('C-Suite') or $result.memberOf | contains('VIP') }}"
+      },
+      "depends_on": ["node_02_extract"],
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_score",
+      "name": "Composite Threat Score Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Builds composite score from enrichment signals. Weights: IP abuse score (35%), geo anomaly (25%), failed count severity (20%), privilege bonus (20%).",
+      "input": {
+        "formula": "({{ $node_03_abuseipdb.ip_abuse_score }} * 0.35) + ({{ $node_04_geoip.geo_is_anomalous }} == true ? 25 : 0) + ({{ $node_02_extract.failed_count }} >= 20 ? 20 : {{ $node_02_extract.failed_count }} >= 10 ? 12 : 6) + ({{ $node_05_ad_lookup.is_privileged }} == true ? 15 : 0) + ({{ $node_02_extract.success_after_fail }} == true ? 20 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_03_abuseipdb", "node_04_geoip", "node_05_ad_lookup"]
+    },
+    {
+      "id": "node_07_decision",
+      "name": "Threat Score Decision Gate",
+      "type": "condition",
+      "description": "Routes to automated lockout and block if composite_score >= 70. Routes to analyst escalation if below threshold. Credential stuffing (success after fail) always triggers containment regardless of score.",
+      "condition": "{{ $node_06_score.composite_score >= variables.THREAT_SCORE_THRESHOLD or $node_02_extract.success_after_fail == true }}",
+      "true_branch": "node_08_lockout_account",
+      "false_branch": "node_11_escalate",
+      "depends_on": ["node_06_score"]
+    },
+    {
+      "id": "node_08_lockout_account",
+      "name": "Active Directory — Disable & Lock Account",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "disable_user",
+      "description": "Disables the targeted AD account to prevent further authentication attempts. Sets flag for analyst review before re-enable. Does NOT permanently delete — preserves audit trail.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.target_username }}",
+        "action": "disable",
+        "reason": "PB-02 | Automated lockout — brute force score: {{ $node_06_score.composite_score }}"
+      },
+      "output_variables": {
+        "lockout_status": "{{ $result.status }}",
+        "lockout_timestamp": "{{ $result.timestamp }}"
+      },
+      "depends_on": ["node_07_decision"],
+      "branch": "true"
+    },
+    {
+      "id": "node_09_block_ip",
+      "name": "Firewall — Block Source IP",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Pushes attacker source IP to perimeter firewall blocklist via REST API. 24-hour TTL for automated blocks — analyst can extend or make permanent.",
+      "input": {
+        "method": "POST",
+        "url": "{{ variables.FIREWALL_API_URL }}/api/v1/blocklist",
+        "headers": {
+          "Authorization": "Bearer {{ variables.FIREWALL_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "indicators": [
+            {
+              "type": "ip",
+              "value": "{{ $node_02_extract.source_ip }}",
+              "reason": "PB-02 Brute force source — abuse score: {{ $node_03_abuseipdb.ip_abuse_score }}",
+              "ttl_hours": 24,
+              "auto_block": true
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_07_decision"],
+      "branch": "true",
+      "parallel_group": "containment"
+    },
+    {
+      "id": "node_10_revoke_sessions",
+      "name": "Azure AD — Revoke Active Sessions",
+      "type": "action",
+      "app": "Microsoft Azure AD",
+      "action": "revoke_sign_in_sessions",
+      "description": "Revokes all active OAuth tokens and sign-in sessions for the compromised account. Prevents attacker from maintaining persistence via stolen session token even after password reset.",
+      "input": {
+        "tenant_id": "{{ secrets.M365_TENANT_ID }}",
+        "client_id": "{{ secrets.M365_CLIENT_ID }}",
+        "client_secret": "{{ secrets.M365_CLIENT_SECRET }}",
+        "user_principal_name": "{{ $node_02_extract.target_username }}"
+      },
+      "depends_on": ["node_07_decision"],
+      "branch": "true",
+      "parallel_group": "containment"
+    },
+    {
+      "id": "node_11_escalate",
+      "name": "TheHive — Create Enriched Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates structured TheHive incident case with full enrichment data. Routed to analyst queue for review regardless of branch — containment cases need analyst sign-off to re-enable account.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-02 | Brute Force — {{ $node_02_extract.target_username }} | Score: {{ $node_06_score.composite_score }} | {{ $node_07_decision.result == true ? 'AUTO-CONTAINED' : 'ANALYST REVIEW' }}",
+        "severity": "{{ $node_05_ad_lookup.is_privileged == true ? 3 : 2 }}",
+        "tags": ["brute-force", "pb02", "authentication", "{{ $node_02_extract.success_after_fail == true ? 'credential-stuffing' : 'brute-force' }}"],
+        "description": "## Brute Force Alert — Automated Triage Output\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule:** {{ $exec.rule_name }}\n**Composite Threat Score:** {{ $node_06_score.composite_score }} / 100\n**Auto-Contained:** {{ $node_07_decision.result }}\n\n### Attack Details\n| Field | Value |\n|---|---|\n| Source IP | {{ $node_02_extract.source_ip }} |\n| Target Account | {{ $node_02_extract.target_username }} |\n| Target Hostname | {{ $node_02_extract.target_hostname }} |\n| Failed Login Count | {{ $node_02_extract.failed_count }} |\n| Successful Login After Brute Force | {{ $node_02_extract.success_after_fail }} |\n| Windows Event ID | {{ $node_02_extract.event_id }} |\n\n### IP Enrichment (AbuseIPDB)\n| Field | Value |\n|---|---|\n| Abuse Confidence Score | {{ $node_03_abuseipdb.ip_abuse_score }} / 100 |\n| Country | {{ $node_03_abuseipdb.ip_country }} |\n| ISP | {{ $node_03_abuseipdb.ip_isp }} |\n| Total Reports | {{ $node_03_abuseipdb.ip_total_reports }} |\n| Tor Exit Node | {{ $node_03_abuseipdb.ip_is_tor }} |\n| Usage Type | {{ $node_03_abuseipdb.ip_usage_type }} |\n\n### Geo Anomaly Check (MaxMind)\n| Field | Value |\n|---|---|\n| Resolved Country | {{ $node_04_geoip.geo_country }} |\n| Resolved City | {{ $node_04_geoip.geo_city }} |\n| Geographic Anomaly | {{ $node_04_geoip.geo_is_anomalous }} |\n| Coordinates | {{ $node_04_geoip.geo_latitude }}, {{ $node_04_geoip.geo_longitude }} |\n\n### Account Context (Active Directory)\n| Field | Value |\n|---|---|\n| Display Name | {{ $node_05_ad_lookup.user_display_name }} |\n| Department | {{ $node_05_ad_lookup.user_department }} |\n| Job Title | {{ $node_05_ad_lookup.user_job_title }} |\n| Last Login | {{ $node_05_ad_lookup.user_last_login }} |\n| Privileged Account | {{ $node_05_ad_lookup.is_privileged }} |\n| Service Account | {{ $node_05_ad_lookup.is_service_account }} |\n| VIP | {{ $node_05_ad_lookup.is_vip }} |\n\n### Containment Actions Taken\n| Action | Status |\n|---|---|\n| AD Account Disabled | {{ $node_08_lockout_account.lockout_status }} |\n| Source IP Firewall Block (24hr) | {{ $node_09_block_ip.result }} |\n| Azure AD Sessions Revoked | {{ $node_10_revoke_sessions.result }} |\n\n### Analyst Next Steps\n1. Confirm brute force vs. legitimate lockout (review failed login timestamps)\n2. Contact account owner to verify activity\n3. If confirmed compromise — force password reset before re-enabling account\n4. Extend firewall block TTL if attack is ongoing\n5. Review VPN / remote access logs for source IP",
+        "observables": [
+          { "dataType": "ip", "data": "{{ $node_02_extract.source_ip }}", "message": "Brute force source IP" },
+          { "dataType": "username", "data": "{{ $node_02_extract.target_username }}", "message": "Targeted AD account" },
+          { "dataType": "hostname", "data": "{{ $node_02_extract.target_hostname }}", "message": "Target authentication endpoint" }
+        ]
+      },
+      "depends_on": ["node_06_score"]
+    },
+    {
+      "id": "node_12_notify",
+      "name": "Slack — SOC & Manager Notification",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Sends structured alert card to SOC channel. If account is privileged or VIP, additionally pings the security manager channel.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "text": "*PB-02 | Brute Force Alert*{{ $node_05_ad_lookup.is_privileged == true ? ' — :rotating_light: PRIVILEGED ACCOUNT' : '' }}",
+          "attachments": [
+            {
+              "color": "{{ $node_06_score.composite_score >= 70 ? '#E24B4A' : '#EF9F27' }}",
+              "fields": [
+                { "title": "Threat Score", "value": "{{ $node_06_score.composite_score }} / 100", "short": true },
+                { "title": "Action Taken", "value": "{{ $node_06_score.composite_score >= 70 ? 'AUTO-LOCKED + IP BLOCKED' : 'ESCALATED TO ANALYST' }}", "short": true },
+                { "title": "Target Account", "value": "{{ $node_02_extract.target_username }}", "short": true },
+                { "title": "Source IP", "value": "{{ $node_02_extract.source_ip }}", "short": true },
+                { "title": "Failed Attempts", "value": "{{ $node_02_extract.failed_count }}", "short": true },
+                { "title": "Login Success After Brute", "value": "{{ $node_02_extract.success_after_fail }}", "short": true },
+                { "title": "IP Abuse Score", "value": "{{ $node_03_abuseipdb.ip_abuse_score }} / 100", "short": true },
+                { "title": "Source Country", "value": "{{ $node_04_geoip.geo_country }} {{ $node_04_geoip.geo_is_anomalous == true ? '(GEO ANOMALY)' : '' }}", "short": true },
+                { "title": "Privileged Account", "value": "{{ $node_05_ad_lookup.is_privileged }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_11_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_11_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    ["node_03_abuseipdb", "node_04_geoip", "node_05_ad_lookup"],
+    "node_06_score",
+    "node_07_decision",
+    ["node_08_lockout_account", "node_09_block_ip", "node_10_revoke_sessions"],
+    "node_11_escalate",
+    "node_12_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Credential Access", "technique": "T1110", "subtechnique": "T1110.001", "name": "Brute Force: Password Guessing" },
+    { "tactic": "Credential Access", "technique": "T1110", "subtechnique": "T1110.003", "name": "Brute Force: Password Spraying" },
+    { "tactic": "Credential Access", "technique": "T1110", "subtechnique": "T1110.004", "name": "Brute Force: Credential Stuffing" },
+    { "tactic": "Defense Evasion", "technique": "T1078", "name": "Valid Accounts" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time (< 3 seconds from alert fire to enrichment complete)",
+    "estimated_mttr_reduction": "~90% for high-confidence automated attacks",
+    "analyst_touchpoint": "Account re-enable always requires analyst sign-off — no auto-unlock"
+  }
+}

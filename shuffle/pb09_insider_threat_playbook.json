@@ -1,0 +1,406 @@
+{
+  "id": "pb09-insider-threat-privileged-v1",
+  "name": "PB-09 | Insider Threat — Privileged User Anomaly Detection",
+  "description": "Production playbook. Ingests privileged account anomaly alerts from Wazuh — off-hours admin logins, lateral spread across systems, bulk sensitive data access, AD modifications, audit log tampering, and unauthorized account creation. Enriches with full AD user context, 30-day behavioral baseline, HR signals, and recent change ticket correlation. Routes to manager notification and account review workflow, or automated account suspension for the highest-confidence threats. Designed specifically for insider threat and privilege abuse scenarios.",
+  "tags": ["insider-threat", "privileged-access", "ueba", "ad", "anomaly", "pb09"],
+  "trigger": {
+    "type": "webhook",
+    "id": "webhook_prod_insider_09",
+    "description": "Listens for Wazuh privileged account anomaly alerts on rule group: insider_threat,pb09 at level >= 12"
+  },
+  "variables": {
+    "AD_DOMAIN_CONTROLLER": "{{ secrets.AD_DOMAIN_CONTROLLER }}",
+    "AD_BIND_USER": "{{ secrets.AD_BIND_USER }}",
+    "AD_BIND_PASSWORD": "{{ secrets.AD_BIND_PASSWORD }}",
+    "M365_TENANT_ID": "{{ secrets.M365_TENANT_ID }}",
+    "M365_CLIENT_ID": "{{ secrets.M365_CLIENT_ID }}",
+    "M365_CLIENT_SECRET": "{{ secrets.M365_CLIENT_SECRET }}",
+    "WAZUH_API_URL": "{{ secrets.WAZUH_API_URL }}",
+    "WAZUH_API_TOKEN": "{{ secrets.WAZUH_API_TOKEN }}",
+    "JIRA_URL": "{{ secrets.JIRA_URL }}",
+    "JIRA_API_TOKEN": "{{ secrets.JIRA_API_TOKEN }}",
+    "JIRA_CHANGE_PROJECT_KEY": "{{ secrets.JIRA_CHANGE_PROJECT_KEY }}",
+    "THEHIVE_API_KEY": "{{ secrets.THEHIVE_API_KEY }}",
+    "THEHIVE_URL": "{{ secrets.THEHIVE_URL }}",
+    "SLACK_WEBHOOK_URL": "{{ secrets.SLACK_WEBHOOK_URL }}",
+    "SLACK_SECURITY_MANAGER_CHANNEL": "{{ secrets.SLACK_SECURITY_MANAGER_CHANNEL }}",
+    "SLACK_SOC_CHANNEL": "{{ secrets.SLACK_SOC_CHANNEL }}",
+    "THREAT_SCORE_THRESHOLD": 70,
+    "LOG_TAMPER_AUTO_SUSPEND": true,
+    "BUSINESS_HOURS_START": "08:00",
+    "BUSINESS_HOURS_END": "18:00"
+  },
+  "nodes": [
+    {
+      "id": "node_01_webhook",
+      "name": "Webhook Trigger",
+      "type": "trigger",
+      "description": "Entry point. Receives Wazuh privileged account anomaly alert payload.",
+      "output_schema": {
+        "alert_id": "string",
+        "timestamp": "string",
+        "rule_id": "string",
+        "rule_name": "string",
+        "artifacts": {
+          "username": "string",
+          "hostname": "string",
+          "agent_id": "string",
+          "event_id": "string",
+          "target_username": "string",
+          "target_hostname": "string",
+          "file_path": "string",
+          "file_access_count": "integer",
+          "hosts_accessed": "array",
+          "hosts_accessed_count": "integer",
+          "ad_object_modified": "string",
+          "ad_object_type": "string",
+          "log_cleared": "boolean",
+          "new_account_name": "string",
+          "new_account_groups": "array",
+          "alert_time": "string",
+          "is_off_hours": "boolean"
+        }
+      }
+    },
+    {
+      "id": "node_02_extract",
+      "name": "Artifact Extraction & Risk Pre-Classification",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "parse_json",
+      "description": "Normalizes privileged activity fields. Pre-flags log tampering for zero-tolerance fast-track — clearing the security event log is never a legitimate operation in a monitored enterprise environment.",
+      "input": {
+        "raw_payload": "{{ $exec }}"
+      },
+      "output_variables": {
+        "username": "{{ $exec.artifacts.username }}",
+        "hostname": "{{ $exec.artifacts.hostname }}",
+        "agent_id": "{{ $exec.artifacts.agent_id }}",
+        "event_id": "{{ $exec.artifacts.event_id }}",
+        "target_username": "{{ $exec.artifacts.target_username }}",
+        "file_path": "{{ $exec.artifacts.file_path }}",
+        "file_access_count": "{{ $exec.artifacts.file_access_count | default(0) }}",
+        "hosts_accessed": "{{ $exec.artifacts.hosts_accessed | default([]) }}",
+        "hosts_accessed_count": "{{ $exec.artifacts.hosts_accessed_count | default(0) }}",
+        "ad_object_modified": "{{ $exec.artifacts.ad_object_modified }}",
+        "ad_object_type": "{{ $exec.artifacts.ad_object_type }}",
+        "log_cleared": "{{ $exec.artifacts.log_cleared | default(false) }}",
+        "new_account_name": "{{ $exec.artifacts.new_account_name }}",
+        "new_account_groups": "{{ $exec.artifacts.new_account_groups | default([]) }}",
+        "is_off_hours": "{{ $exec.artifacts.is_off_hours | default(false) }}",
+        "alert_time": "{{ $exec.artifacts.alert_time | default($exec.timestamp) }}",
+        "log_tamper_flag": "{{ $exec.rule_id == '100084' }}",
+        "is_ad_modification": "{{ $exec.rule_id == '100083' }}",
+        "is_account_creation": "{{ $exec.rule_id == '100085' }}"
+      },
+      "depends_on": ["node_01_webhook"]
+    },
+    {
+      "id": "node_03_log_tamper_gate",
+      "name": "Log Tampering Zero-Tolerance Gate",
+      "type": "condition",
+      "description": "Security audit log clearing (EventID 1102) and audit policy modification (4719/4739) bypass the full enrichment pipeline. An insider clearing the security log is actively destroying forensic evidence — this is an immediate account suspension trigger with no score threshold.",
+      "condition": "{{ $node_02_extract.log_tamper_flag == true and variables.LOG_TAMPER_AUTO_SUSPEND == true }}",
+      "true_branch": "node_10_suspend_account",
+      "false_branch": "node_04_ad_context",
+      "depends_on": ["node_02_extract"]
+    },
+    {
+      "id": "node_04_ad_context",
+      "name": "Active Directory — Full Privileged User Context",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "get_user",
+      "description": "Pulls comprehensive AD user context. Checks all privilege group memberships, account age, recent password changes, logon hours policy, and HR signals stored in extensionAttributes.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.username }}"
+      },
+      "output_variables": {
+        "user_display_name": "{{ $result.displayName }}",
+        "user_department": "{{ $result.department }}",
+        "user_job_title": "{{ $result.jobTitle }}",
+        "user_manager": "{{ $result.manager }}",
+        "user_manager_email": "{{ $result.manager_email }}",
+        "user_groups": "{{ $result.memberOf }}",
+        "user_account_created": "{{ $result.whenCreated }}",
+        "user_last_pw_change": "{{ $result.pwdLastSet }}",
+        "user_logon_hours": "{{ $result.logonHours }}",
+        "user_last_login": "{{ $result.lastLogon }}",
+        "hr_signal": "{{ $result.extensionAttribute3 }}",
+        "is_domain_admin": "{{ $result.memberOf | contains('Domain Admins') }}",
+        "is_enterprise_admin": "{{ $result.memberOf | contains('Enterprise Admins') }}",
+        "is_schema_admin": "{{ $result.memberOf | contains('Schema Admins') }}",
+        "is_backup_operator": "{{ $result.memberOf | contains('Backup Operators') }}",
+        "is_pending_termination": "{{ $result.extensionAttribute3 | contains('pending_termination') or $result.extensionAttribute3 | contains('resignation') }}",
+        "account_age_days": "{{ days_since($result.whenCreated) }}",
+        "is_new_account": "{{ days_since($result.whenCreated) <= 7 }}"
+      },
+      "depends_on": ["node_03_log_tamper_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_05_behavior_baseline",
+      "name": "Wazuh API — 30-Day Privileged Activity Baseline",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries Wazuh for the user's privileged activity patterns over 30 days — which systems they typically access, what hours they normally work, how many unique hosts they authenticate to per day. Builds a behavioral baseline to determine whether today's activity is anomalous.",
+      "input": {
+        "method": "GET",
+        "url": "{{ variables.WAZUH_API_URL }}/security/events",
+        "headers": {
+          "Authorization": "Bearer {{ variables.WAZUH_API_TOKEN }}"
+        },
+        "params": {
+          "q": "data.win.eventdata.targetUserName:{{ $node_02_extract.username }} AND rule.groups:authentication",
+          "timeframe": "2592000",
+          "select": "data.win.eventdata.workstationName,timestamp,data.win.system.eventID",
+          "limit": 500
+        }
+      },
+      "output_variables": {
+        "baseline_unique_hosts_per_day": "{{ $result.data.affected_items | group_by('date') | map('data.win.eventdata.workstationName') | map('unique') | map('length') | average | round(1) }}",
+        "baseline_typical_hours": "{{ $result.data.affected_items | map('timestamp') | map('hour') | mode }}",
+        "baseline_total_events_30d": "{{ $result.data.total_affected_items }}",
+        "baseline_known_hosts": "{{ $result.data.affected_items | map('data.win.eventdata.workstationName') | unique }}",
+        "is_new_system_accessed": "{{ not ($node_02_extract.hostname | in($result.data.affected_items | map('data.win.eventdata.workstationName') | unique)) }}",
+        "hosts_today_vs_baseline": "{{ $node_02_extract.hosts_accessed_count / ($result.data.affected_items | group_by('date') | map('data.win.eventdata.workstationName') | map('unique') | map('length') | average) }}"
+      },
+      "depends_on": ["node_03_log_tamper_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_06_change_ticket_check",
+      "name": "Jira — Approved Change Ticket Correlation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Searches Jira change management for an approved, in-progress change ticket assigned to this user covering the current time window. Legitimate admin work during off-hours is always covered by an approved change. No change ticket = unauthorized activity.",
+      "input": {
+        "method": "GET",
+        "url": "{{ variables.JIRA_URL }}/rest/api/3/search",
+        "headers": {
+          "Authorization": "Bearer {{ variables.JIRA_API_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "params": {
+          "jql": "project = {{ variables.JIRA_CHANGE_PROJECT_KEY }} AND assignee = '{{ $node_02_extract.username }}' AND status in ('Approved', 'In Progress') AND 'Scheduled Start' <= now() AND 'Scheduled End' >= now()",
+          "maxResults": 1
+        }
+      },
+      "output_variables": {
+        "has_approved_change": "{{ $result.total > 0 }}",
+        "change_ticket_key": "{{ $result.issues[0].key }}",
+        "change_ticket_summary": "{{ $result.issues[0].fields.summary }}",
+        "change_scheduled_end": "{{ $result.issues[0].fields.customfield_scheduled_end }}"
+      },
+      "depends_on": ["node_03_log_tamper_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_07_m365_recent_activity",
+      "name": "M365 Audit — Recent Admin Operations",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "http_request",
+      "description": "Queries M365 Unified Audit Log for the user's admin operations in the last 12 hours — Exchange admin actions, SharePoint permission grants, Azure AD role assignments, Teams policy changes. Builds a complete picture of the user's recent privileged footprint.",
+      "input": {
+        "method": "GET",
+        "url": "https://management.azure.com/providers/Microsoft.Insights/eventtypes/management/values",
+        "headers": {
+          "Authorization": "Bearer {{ secrets.M365_AUDIT_TOKEN }}"
+        },
+        "params": {
+          "filter": "eventTimestamp ge '{{ now() | subtract_hours(12) }}' and caller eq '{{ $node_02_extract.username }}' and category eq 'Administrative'",
+          "api-version": "2015-04-01"
+        }
+      },
+      "output_variables": {
+        "admin_ops_count": "{{ $result.value | length }}",
+        "role_assignments": "{{ $result.value | filter(e => e.operationName.value | contains('RoleAssignment')) | length }}",
+        "permission_grants": "{{ $result.value | filter(e => e.operationName.value | contains('AppRoleAssignment') or e.operationName.value | contains('DelegatedPermissionGrant')) | length }}",
+        "policy_changes": "{{ $result.value | filter(e => e.operationName.value | contains('Policy') or e.operationName.value | contains('ConditionalAccess')) | length }}",
+        "mailbox_access": "{{ $result.value | filter(e => e.operationName.value | contains('MailboxPermission')) | length }}",
+        "high_risk_ops": "{{ $result.value | filter(e => e.operationName.value | contains('RoleAssignment') or e.operationName.value | contains('GlobalAdmin') or e.operationName.value | contains('PrivilegedRole')) | map('operationName.value') }}"
+      },
+      "depends_on": ["node_03_log_tamper_gate"],
+      "branch": "false",
+      "parallel_group": "enrichment"
+    },
+    {
+      "id": "node_08_score",
+      "name": "Insider Threat Risk Score Calculation",
+      "type": "action",
+      "app": "Shuffle Tools",
+      "action": "calculate",
+      "description": "Combines all enrichment signals into an insider threat risk score. No approved change ticket for off-hours admin work carries the highest single weight — legitimate admins always have change control coverage. Log tampering, AD modification, and pending termination are additional high-weight signals.",
+      "input": {
+        "formula": "({{ $node_02_extract.is_off_hours }} == true and {{ $node_06_change_ticket_check.has_approved_change }} == false ? 30 : 0) + ({{ $node_02_extract.is_ad_modification }} == true ? 20 : 0) + ({{ $node_04_ad_context.is_pending_termination }} == true ? 20 : 0) + ({{ $node_04_ad_context.is_domain_admin }} == true ? 10 : 0) + ({{ $node_05_behavior_baseline.is_new_system_accessed }} == true ? 10 : 0) + ({{ $node_05_behavior_baseline.hosts_today_vs_baseline }} >= 3 ? 15 : {{ $node_05_behavior_baseline.hosts_today_vs_baseline }} >= 2 ? 8 : 0) + ({{ $node_07_m365_recent_activity.role_assignments }} > 0 ? 15 : 0) + ({{ $node_07_m365_recent_activity.permission_grants }} > 0 ? 10 : 0) + ({{ $node_04_ad_context.is_new_account }} == true ? 15 : 0) + ({{ $node_02_extract.is_account_creation }} == true ? 15 : 0)"
+      },
+      "output_variables": {
+        "composite_score": "{{ $result }}"
+      },
+      "depends_on": ["node_04_ad_context", "node_05_behavior_baseline", "node_06_change_ticket_check", "node_07_m365_recent_activity"]
+    },
+    {
+      "id": "node_09_decision",
+      "name": "Insider Threat Risk Decision Gate",
+      "type": "condition",
+      "description": "Routes to automated account suspension if score >= 70. Lower-risk signals (off-hours admin with change ticket, new system accessed once) route to manager notification only — less disruptive for legitimate privileged work. Log tampering always triggers suspension via the zero-tolerance gate regardless of score.",
+      "condition": "{{ $node_08_score.composite_score >= variables.THREAT_SCORE_THRESHOLD }}",
+      "true_branch": "node_10_suspend_account",
+      "false_branch": "node_11_manager_notify",
+      "depends_on": ["node_08_score"]
+    },
+    {
+      "id": "node_10_suspend_account",
+      "name": "Active Directory — Suspend Privileged Account",
+      "type": "action",
+      "app": "Microsoft Active Directory",
+      "action": "disable_user",
+      "description": "Disables the privileged AD account. For domain admins and enterprise admins, also removes the account from privileged groups before disabling — prevents the account from being re-enabled and retaining elevated privileges without explicit analyst review.",
+      "input": {
+        "domain_controller": "{{ variables.AD_DOMAIN_CONTROLLER }}",
+        "bind_user": "{{ variables.AD_BIND_USER }}",
+        "bind_password": "{{ variables.AD_BIND_PASSWORD }}",
+        "username": "{{ $node_02_extract.username }}",
+        "action": "disable",
+        "remove_from_groups": "{{ $node_04_ad_context.is_domain_admin == true or $node_04_ad_context.is_enterprise_admin == true }}",
+        "groups_to_remove": ["Domain Admins", "Enterprise Admins", "Schema Admins"],
+        "reason": "PB-09 | Automated suspension — insider threat risk score: {{ $node_08_score.composite_score }}. Rule: {{ $exec.rule_id }}. Log tamper: {{ $node_02_extract.log_tamper_flag }}"
+      },
+      "output_variables": {
+        "suspension_status": "{{ $result.status }}",
+        "groups_removed": "{{ $result.groups_removed }}"
+      },
+      "depends_on": ["node_03_log_tamper_gate", "node_09_decision"]
+    },
+    {
+      "id": "node_11_manager_notify",
+      "name": "Email — Notify Manager & Security Manager",
+      "type": "action",
+      "app": "Microsoft 365",
+      "action": "send_email",
+      "description": "Sends structured notification email to the user's direct manager and the security manager. Insider threat investigations require manager involvement before any user confrontation — this notification initiates that coordination while preserving investigation confidentiality.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "to": "{{ $node_04_ad_context.user_manager_email }}",
+        "cc": "security@yourorg.com",
+        "subject": "[CONFIDENTIAL] Security Alert — Privileged Account Activity Review Required: {{ $node_02_extract.username }}",
+        "body": "This message is confidential and intended for the recipient and security team only.\n\nDear {{ $node_04_ad_context.user_manager }},\n\nOur security monitoring system has detected unusual privileged account activity associated with {{ $node_02_extract.username }} ({{ $node_04_ad_context.user_display_name }}) that requires your review.\n\nActivity Summary:\n- Alert Type: {{ $exec.rule_name }}\n- Timestamp: {{ $exec.timestamp }}\n- System Involved: {{ $node_02_extract.hostname }}\n- Risk Score: {{ $node_08_score.composite_score }} / 100\n- Approved Change Ticket: {{ $node_06_change_ticket_check.has_approved_change }} {{ $node_06_change_ticket_check.has_approved_change == true ? '(' + $node_06_change_ticket_check.change_ticket_key + ')' : '— NONE FOUND' }}\n\nRequired Action:\nPlease confirm with the Security Operations team whether this activity was authorized and expected.\n\nDo NOT discuss this notification with the employee until contacted by the Security team.\n\nContact: security@yourorg.com | Priority: HIGH\n\nThis is an automated notification from the Security Operations Center."
+      },
+      "output_variables": {
+        "notification_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_09_decision"]
+    },
+    {
+      "id": "node_12_revoke_sessions",
+      "name": "Azure AD — Revoke Active Sessions",
+      "type": "action",
+      "app": "Microsoft Azure AD",
+      "action": "revoke_sign_in_sessions",
+      "description": "Revokes all active Azure AD sessions for the suspended account. Prevents the insider from maintaining access via existing browser sessions or cached OAuth tokens after account disable.",
+      "input": {
+        "tenant_id": "{{ variables.M365_TENANT_ID }}",
+        "client_id": "{{ variables.M365_CLIENT_ID }}",
+        "client_secret": "{{ variables.M365_CLIENT_SECRET }}",
+        "user_principal_name": "{{ $node_02_extract.username }}"
+      },
+      "output_variables": {
+        "revocation_status": "{{ $result.status }}"
+      },
+      "depends_on": ["node_10_suspend_account"]
+    },
+    {
+      "id": "node_13_escalate",
+      "name": "TheHive — Create Insider Threat Case",
+      "type": "action",
+      "app": "TheHive",
+      "action": "create_case",
+      "description": "Creates a structured TheHive insider threat investigation case. Marked as confidential — insider threat cases require careful handling to avoid tipping off the subject before investigation is complete. Includes full behavioral baseline comparison, change ticket status, M365 admin operations, and investigation checklist.",
+      "input": {
+        "url": "{{ variables.THEHIVE_URL }}",
+        "apiKey": "{{ variables.THEHIVE_API_KEY }}",
+        "title": "PB-09 | Insider Threat — {{ $node_04_ad_context.user_display_name }} ({{ $node_02_extract.username }}) | {{ $exec.rule_name | truncate(50) }} | Score: {{ $node_08_score.composite_score }}",
+        "severity": "{{ $node_04_ad_context.is_domain_admin == true ? 4 : $node_08_score.composite_score >= 80 ? 3 : 2 }}",
+        "tags": ["insider-threat", "pb09", "privileged-access", "{{ $node_02_extract.log_tamper_flag == true ? 'log-tampering' : '' }}", "{{ $node_02_extract.is_ad_modification == true ? 'ad-modification' : '' }}", "{{ $node_04_ad_context.is_pending_termination == true ? 'pending-termination' : '' }}", "CONFIDENTIAL"],
+        "description": "## INSIDER THREAT — CONFIDENTIAL\n\n> This case involves a current employee. Do not contact the subject directly. Coordinate with HR and Legal before any confrontation.\n\n**Alert ID:** {{ $exec.alert_id }}\n**Timestamp:** {{ $exec.timestamp }}\n**Rule:** {{ $exec.rule_name }}\n**Risk Score:** {{ $node_08_score.composite_score }} / 100\n**Account Suspended:** {{ $node_10_suspend_account.suspension_status }}\n**Manager Notified:** {{ $node_11_manager_notify.notification_status }}\n\n### Subject Profile\n| Field | Value |\n|---|---|\n| Username | {{ $node_02_extract.username }} |\n| Display Name | {{ $node_04_ad_context.user_display_name }} |\n| Department | {{ $node_04_ad_context.user_department }} |\n| Job Title | {{ $node_04_ad_context.user_job_title }} |\n| Manager | {{ $node_04_ad_context.user_manager }} |\n| Domain Admin | {{ $node_04_ad_context.is_domain_admin }} |\n| Enterprise Admin | {{ $node_04_ad_context.is_enterprise_admin }} |\n| Account Age | {{ $node_04_ad_context.account_age_days }} days |\n| New Account (≤7d) | {{ $node_04_ad_context.is_new_account }} |\n| HR Signal | {{ $node_04_ad_context.hr_signal }} |\n| Pending Termination | {{ $node_04_ad_context.is_pending_termination }} |\n\n### Triggering Activity\n| Field | Value |\n|---|---|\n| Alert Rule | {{ $exec.rule_name }} |\n| Hostname | {{ $node_02_extract.hostname }} |\n| Is Off-Hours | {{ $node_02_extract.is_off_hours }} |\n| Log Cleared | {{ $node_02_extract.log_cleared }} |\n| AD Object Modified | {{ $node_02_extract.ad_object_modified }} |\n| AD Object Type | {{ $node_02_extract.ad_object_type }} |\n| File Path | {{ $node_02_extract.file_path }} |\n| File Access Count | {{ $node_02_extract.file_access_count }} |\n| Hosts Accessed | {{ $node_02_extract.hosts_accessed | join(', ') }} |\n| Hosts Accessed Count | {{ $node_02_extract.hosts_accessed_count }} |\n| New Account Created | {{ $node_02_extract.new_account_name }} |\n\n### Change Management Correlation\n| Field | Value |\n|---|---|\n| Approved Change Ticket | {{ $node_06_change_ticket_check.has_approved_change }} |\n| Ticket Key | {{ $node_06_change_ticket_check.change_ticket_key | default('None') }} |\n| Change Summary | {{ $node_06_change_ticket_check.change_ticket_summary | default('N/A') }} |\n| Change Scheduled End | {{ $node_06_change_ticket_check.change_scheduled_end | default('N/A') }} |\n\n### Behavioral Baseline Comparison (30 Days)\n| Field | Value |\n|---|---|\n| Avg Unique Hosts/Day (baseline) | {{ $node_05_behavior_baseline.baseline_unique_hosts_per_day }} |\n| Hosts Accessed Today | {{ $node_02_extract.hosts_accessed_count }} |\n| Ratio vs Baseline | {{ $node_05_behavior_baseline.hosts_today_vs_baseline | round(1) }}× |\n| New System Accessed | {{ $node_05_behavior_baseline.is_new_system_accessed }} |\n| Total Auth Events (30d) | {{ $node_05_behavior_baseline.baseline_total_events_30d }} |\n\n### M365 Admin Operations (Last 12 Hours)\n| Activity | Count |\n|---|---|\n| Total Admin Ops | {{ $node_07_m365_recent_activity.admin_ops_count }} |\n| Role Assignments | {{ $node_07_m365_recent_activity.role_assignments }} |\n| Permission Grants | {{ $node_07_m365_recent_activity.permission_grants }} |\n| Policy Changes | {{ $node_07_m365_recent_activity.policy_changes }} |\n| Mailbox Access | {{ $node_07_m365_recent_activity.mailbox_access }} |\n| High-Risk Operations | {{ $node_07_m365_recent_activity.high_risk_ops | join(', ') }} |\n\n### Containment Actions Taken\n| Action | Status |\n|---|---|\n| AD Account Suspended | {{ $node_10_suspend_account.suspension_status }} |\n| Privileged Groups Removed | {{ $node_10_suspend_account.groups_removed | join(', ') }} |\n| Azure AD Sessions Revoked | {{ $node_12_revoke_sessions.revocation_status }} |\n| Manager Notification Sent | {{ $node_11_manager_notify.notification_status }} |\n\n### Investigation Checklist — HANDLE WITH CARE\n- [ ] Do NOT contact subject until HR and Legal have been briefed\n- [ ] Confirm with manager whether activity was authorized\n- [ ] Pull full AD audit log for the past 30 days for this account\n- [ ] Review all systems accessed ({{ $node_02_extract.hosts_accessed | join(', ') }}) for unauthorized changes\n- [ ] Collect M365 audit log export before account re-enable\n- [ ] Review all files accessed on sensitive paths — determine if data was copied or exfiltrated\n- [ ] Check for new accounts, scheduled tasks, or persistence mechanisms created by this account\n- [ ] If log cleared — attempt recovery from Windows event log backup or SIEM\n- [ ] Coordinate with HR: if confirmed insider threat, follow HR disciplinary and legal process\n- [ ] If account re-enable required — remove from privileged groups, reset password, re-add to standard groups only\n- [ ] Document all findings for potential legal proceedings",
+        "observables": [
+          { "dataType": "username", "data": "{{ $node_02_extract.username }}", "message": "Subject account" },
+          { "dataType": "hostname", "data": "{{ $node_02_extract.hostname }}", "message": "Involved system" },
+          { "dataType": "other", "data": "{{ $node_04_ad_context.user_manager }}", "message": "Subject's manager" },
+          { "dataType": "other", "data": "Change ticket: {{ $node_06_change_ticket_check.change_ticket_key | default('None') }}", "message": "Change management status" }
+        ]
+      },
+      "depends_on": ["node_08_score", "node_10_suspend_account", "node_11_manager_notify", "node_12_revoke_sessions"]
+    },
+    {
+      "id": "node_14_notify",
+      "name": "Slack — Security Manager Alert (Confidential)",
+      "type": "action",
+      "app": "Slack",
+      "action": "post_message",
+      "description": "Posts to the security manager channel — NOT the general SOC channel. Insider threat investigations are need-to-know only. The SOC channel gets a sanitized high-level alert; the manager channel gets the full detail.",
+      "input": {
+        "webhook_url": "{{ variables.SLACK_WEBHOOK_URL }}",
+        "payload": {
+          "channel": "{{ variables.SLACK_SECURITY_MANAGER_CHANNEL }}",
+          "text": "*PB-09 | INSIDER THREAT ALERT — CONFIDENTIAL*{{ $node_02_extract.log_tamper_flag == true ? ' :rotating_light: LOG TAMPERING' : '' }}{{ $node_04_ad_context.is_domain_admin == true ? ' — DOMAIN ADMIN' : '' }}",
+          "attachments": [
+            {
+              "color": "{{ $node_08_score.composite_score >= 80 ? '#E24B4A' : '#EF9F27' }}",
+              "fields": [
+                { "title": "Risk Score", "value": "{{ $node_08_score.composite_score }} / 100", "short": true },
+                { "title": "Action", "value": "{{ $node_09_decision.result == true ? 'ACCOUNT SUSPENDED' : 'MANAGER NOTIFIED' }}", "short": true },
+                { "title": "Subject", "value": "{{ $node_04_ad_context.user_display_name }} ({{ $node_02_extract.username }})", "short": true },
+                { "title": "Department", "value": "{{ $node_04_ad_context.user_department }}", "short": true },
+                { "title": "Domain Admin", "value": "{{ $node_04_ad_context.is_domain_admin }}", "short": true },
+                { "title": "Pending Termination", "value": "{{ $node_04_ad_context.is_pending_termination }}", "short": true },
+                { "title": "Alert Type", "value": "{{ $exec.rule_name }}", "short": false },
+                { "title": "Approved Change Ticket", "value": "{{ $node_06_change_ticket_check.has_approved_change == true ? $node_06_change_ticket_check.change_ticket_key : 'NONE — unauthorized activity' }}", "short": true },
+                { "title": "Hosts Accessed", "value": "{{ $node_02_extract.hosts_accessed_count }} (baseline: {{ $node_05_behavior_baseline.baseline_unique_hosts_per_day }}/day)", "short": true },
+                { "title": "Manager", "value": "{{ $node_04_ad_context.user_manager }}", "short": true },
+                { "title": "Log Tampering", "value": "{{ $node_02_extract.log_tamper_flag }}", "short": true },
+                { "title": "TheHive Case", "value": "{{ $node_13_escalate.case_url }}", "short": false }
+              ]
+            }
+          ]
+        }
+      },
+      "depends_on": ["node_13_escalate"]
+    }
+  ],
+  "execution_order": [
+    "node_01_webhook",
+    "node_02_extract",
+    "node_03_log_tamper_gate",
+    ["node_04_ad_context", "node_05_behavior_baseline", "node_06_change_ticket_check", "node_07_m365_recent_activity"],
+    "node_08_score",
+    "node_09_decision",
+    "node_10_suspend_account",
+    ["node_11_manager_notify", "node_12_revoke_sessions"],
+    "node_13_escalate",
+    "node_14_notify"
+  ],
+  "mitre_attack": [
+    { "tactic": "Defense Evasion", "technique": "T1070", "subtechnique": "T1070.001", "name": "Indicator Removal: Clear Windows Event Logs" },
+    { "tactic": "Lateral Movement", "technique": "T1021", "subtechnique": "T1021.002", "name": "Remote Services: SMB/Windows Admin Shares" },
+    { "tactic": "Privilege Escalation", "technique": "T1078", "subtechnique": "T1078.002", "name": "Valid Accounts: Domain Accounts" },
+    { "tactic": "Persistence", "technique": "T1098", "name": "Account Manipulation" },
+    { "tactic": "Collection", "technique": "T1005", "name": "Data from Local System" }
+  ],
+  "metrics": {
+    "estimated_mttd_reduction": "Real-time — Wazuh fires on privileged event immediately",
+    "estimated_mttr_reduction": "Account suspended and sessions revoked in < 5 seconds for log tamper or high-score path",
+    "key_differentiator": "Change ticket correlation — no approved change ticket for off-hours admin work = highest single risk weight"
+  }
+}
