@@ -227,7 +227,7 @@ Expected output: VirusTotal and AbuseIPDB enrichment results visible in Shuffle 
 
 ---
 
-## Interview Talking Points
+## Summary
 
 > "I built PB-01 as the first playbook in a 10-playbook automated IR pipeline. It ingests phishing alerts from Wazuh via asynchronous JSON webhook, runs parallel enrichment across VirusTotal for hash reputation, AbuseIPDB for source IP scoring, and Active Directory for blast radius context. I built a weighted composite scoring engine inside Shuffle that combines those three signals — VT detection ratio at 50%, IP abuse confidence at 30%, and a VIP privilege bonus at 20% — and routes automatically to containment if the score clears 75. Containment triggers three actions in parallel: a hard-delete purge across all M365 mailboxes via the Graph API, an IP and domain block pushed to the firewall via REST, and conditional host isolation through CrowdStrike if EDR confirms the attachment executed. Below the threshold it creates an enriched TheHive case with every artifact and score attached and pings the SOC Slack channel. This eliminated the Tier 1 triage layer entirely for high-confidence phishing."
 
