@@ -201,7 +201,7 @@ docker exec wazuh-manager-production /var/ossec/bin/wazuh-control restart
 
 ---
 
-## Interview Summary
+## Summary
 
 This repository demonstrates:
 
