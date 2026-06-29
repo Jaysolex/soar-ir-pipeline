@@ -1,52 +1,38 @@
 <group name="ransomware,malware,endpoint,">
-
-  <!-- Rule 1: Mass file rename/extension change (ransomware encryption pattern) -->
-  <rule id="100020" level="15" frequency="20" timeframe="30">
-    <if_matched_sid>554</if_matched_sid>
-    <field name="audit.file.name">\.locked$|\.encrypted$|\.enc$|\.crypt$|\.crypted$|\.zzzzz$|\.wncry$|\.cerber$|\.locky$|\.zepto$|\.odin$</field>
-    <description>PB-03 | Ransomware — mass file extension rename detected (20+ files in 30 seconds)</description>
+  <rule id="100020" level="15">
+    <decoded_as>json</decoded_as>
+    <match>\.locked|\.encrypted|\.enc|\.crypt|\.wncry|\.cerber|\.locky</match>
+    <description>PB-03 | Ransomware — mass file extension rename detected</description>
     <group>ransomware,file_encryption,pb03,</group>
   </rule>
-
-  <!-- Rule 2: Ransomware note file creation -->
   <rule id="100021" level="14">
-    <if_matched_sid>554</if_matched_sid>
-    <field name="audit.file.name">README_FOR_DECRYPT|HOW_TO_DECRYPT|DECRYPT_INSTRUCTIONS|RESTORE_FILES|YOUR_FILES_ARE_ENCRYPTED|ransom_note</field>
+    <decoded_as>json</decoded_as>
+    <match>README_FOR_DECRYPT|HOW_TO_DECRYPT|DECRYPT_INSTRUCTIONS|YOUR_FILES_ARE_ENCRYPTED</match>
     <description>PB-03 | Ransomware note file created on filesystem</description>
     <group>ransomware,ransom_note,pb03,</group>
   </rule>
-
-  <!-- Rule 3: Volume shadow copy deletion (standard ransomware pre-encryption step) -->
   <rule id="100022" level="15">
-    <decoded_as>windows_eventchannel</decoded_as>
-    <field name="win.eventdata.commandLine">vssadmin.*delete.*shadows|wmic.*shadowcopy.*delete|bcdedit.*recoveryenabled.*no|wbadmin.*delete.*catalog</field>
-    <description>PB-03 | Volume shadow copy deletion — ransomware pre-encryption step detected</description>
-    <group>ransomware,shadow_copy,defense_evasion,pb03,</group>
+    <decoded_as>json</decoded_as>
+    <match>vssadmin.*delete|shadowcopy.*delete|bcdedit.*recoveryenabled.*no</match>
+    <description>PB-03 | Volume shadow copy deletion — ransomware pre-encryption step</description>
+    <group>ransomware,shadow_copy,pb03,</group>
   </rule>
-
-  <!-- Rule 4: High entropy file write activity (encryption in progress) -->
-  <rule id="100023" level="13" frequency="50" timeframe="60">
-    <if_matched_sid>554</if_matched_sid>
-    <field name="audit.type">WRITE</field>
-    <description>PB-03 | High-frequency file write activity — possible encryption in progress (50+ writes in 60 seconds)</description>
+  <rule id="100023" level="13">
+    <decoded_as>json</decoded_as>
+    <match>high_frequency_write|mass_file_write|encryption_in_progress</match>
+    <description>PB-03 | High-frequency file write activity detected</description>
     <group>ransomware,file_activity,pb03,</group>
   </rule>
-
-  <!-- Rule 5: Known ransomware process names -->
   <rule id="100024" level="15">
-    <decoded_as>windows_eventchannel</decoded_as>
-    <field name="win.eventdata.image">wannacry|wcry|petya|notpetya|ryuk|conti|lockbit|blackcat|hive|revil|sodinokibi</field>
-    <description>PB-03 | Known ransomware binary name detected in process execution</description>
+    <decoded_as>json</decoded_as>
+    <match>wannacry|wcry|petya|notpetya|ryuk|conti|lockbit|blackcat|revil|sodinokibi</match>
+    <description>PB-03 | Known ransomware binary name detected</description>
     <group>ransomware,known_malware,pb03,</group>
   </rule>
-
-  <!-- Rule 6: Lateral movement prep — network share enumeration before encryption -->
   <rule id="100025" level="12">
-    <decoded_as>windows_eventchannel</decoded_as>
-    <field name="win.system.eventID">^5145$</field>
-    <field name="win.eventdata.shareType">DISK</field>
-    <description>PB-03 | Network share access audit — potential ransomware lateral spread enumeration (EventID 5145)</description>
-    <group>ransomware,lateral_movement,network_share,pb03,</group>
+    <decoded_as>json</decoded_as>
+    <match>network_share_access|smb_enumeration|lateral_spread</match>
+    <description>PB-03 | Network share enumeration — potential ransomware lateral spread</description>
+    <group>ransomware,lateral_movement,pb03,</group>
   </rule>
-
 </group>

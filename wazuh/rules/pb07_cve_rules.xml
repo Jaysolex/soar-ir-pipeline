@@ -1,60 +1,38 @@
-<group name="vulnerability,cve,patch_management,compliance,">
-
-  <!-- Rule 1: Critical CVSS 9.0+ vulnerability detected by scanner -->
+<group name="vulnerability,cve,">
   <rule id="100060" level="13">
     <decoded_as>json</decoded_as>
-    <field name="source">Tenable|Nessus|OpenVAS|Qualys</field>
-    <field name="cvss_score">\b(9\.[0-9]|10\.0)\b</field>
+    <match>critical_vulnerability|cvss_critical|cvss_score_9</match>
     <description>PB-07 | Critical vulnerability detected — CVSS score 9.0 or higher</description>
     <group>vulnerability,critical_cve,pb07,</group>
   </rule>
-
-  <!-- Rule 2: High CVSS 7.0–8.9 on internet-facing or privileged host -->
   <rule id="100061" level="12">
     <decoded_as>json</decoded_as>
-    <field name="source">Tenable|Nessus|OpenVAS|Qualys</field>
-    <field name="cvss_score">\b([7-8]\.[0-9])\b</field>
-    <field name="host_classification">internet_facing|dmz|domain_controller|database_server</field>
-    <description>PB-07 | High vulnerability on critical infrastructure host — CVSS 7.0-8.9 on internet-facing or privileged system</description>
-    <group>vulnerability,high_cve,critical_host,pb07,</group>
+    <match>high_vulnerability|internet_facing_vuln|critical_host_vuln</match>
+    <description>PB-07 | High vulnerability on critical infrastructure host</description>
+    <group>vulnerability,high_cve,pb07,</group>
   </rule>
-
-  <!-- Rule 3: Known exploited CVE detected (CISA KEV list match) -->
   <rule id="100062" level="15">
     <decoded_as>json</decoded_as>
-    <field name="cve_id">CVE-</field>
-    <field name="in_cisa_kev">true</field>
-    <description>PB-07 | CVE in CISA Known Exploited Vulnerabilities catalog — active exploitation confirmed in the wild</description>
-    <group>vulnerability,cisa_kev,actively_exploited,pb07,</group>
+    <match>cisa_kev|known_exploited|actively_exploited_cve</match>
+    <description>PB-07 | CVE in CISA Known Exploited Vulnerabilities catalog</description>
+    <group>vulnerability,cisa_kev,pb07,</group>
   </rule>
-
-  <!-- Rule 4: Vulnerability on SLA breach path — unpatched for >30 days -->
   <rule id="100063" level="12">
     <decoded_as>json</decoded_as>
-    <field name="source">Tenable|Nessus|OpenVAS|Qualys</field>
-    <field name="days_since_discovery">\b([3-9][0-9]|[1-9][0-9]{2,})\b</field>
-    <field name="cvss_score">\b([7-9]\.[0-9]|10\.0)\b</field>
-    <description>PB-07 | High/Critical vulnerability approaching SLA breach — unpatched for 30+ days</description>
+    <match>sla_breach|unpatched_30_days|patch_overdue</match>
+    <description>PB-07 | High vulnerability approaching SLA breach — unpatched 30 days or more</description>
     <group>vulnerability,sla_breach,pb07,</group>
   </rule>
-
-  <!-- Rule 5: RCE or privilege escalation vulnerability category -->
   <rule id="100064" level="14">
     <decoded_as>json</decoded_as>
-    <field name="vulnerability_type">Remote Code Execution|Privilege Escalation|Authentication Bypass|SQL Injection</field>
-    <field name="cvss_score">\b([7-9]\.[0-9]|10\.0)\b</field>
-    <description>PB-07 | High-impact vulnerability class — RCE, privesc, auth bypass, or SQLi with CVSS 7.0+</description>
-    <group>vulnerability,high_impact_class,pb07,</group>
+    <match>remote_code_execution|privilege_escalation|authentication_bypass|sql_injection</match>
+    <description>PB-07 | High-impact vulnerability class detected</description>
+    <group>vulnerability,high_impact,pb07,</group>
   </rule>
-
-  <!-- Rule 6: Patch Tuesday — Microsoft critical patch unapplied after 7 days -->
   <rule id="100065" level="11">
     <decoded_as>json</decoded_as>
-    <field name="source">WindowsUpdateLog|WSUS|SCCM</field>
-    <field name="patch_status">missing|failed|deferred</field>
-    <field name="patch_severity">Critical|Important</field>
-    <description>PB-07 | Critical/Important Windows patch missing or failed to apply</description>
-    <group>vulnerability,windows_patch,patch_management,pb07,</group>
+    <match>missing_patch|patch_failed|critical_patch_missing|windows_update_failed</match>
+    <description>PB-07 | Critical Windows patch missing or failed to apply</description>
+    <group>vulnerability,windows_patch,pb07,</group>
   </rule>
-
 </group>

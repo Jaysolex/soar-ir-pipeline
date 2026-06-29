@@ -1,60 +1,38 @@
-<group name="authentication,identity,impossible_travel,geo_anomaly,">
-
-  <!-- Rule 1: Successful login from two countries within 2 hours (impossible travel) -->
-  <rule id="100040" level="14" frequency="2" timeframe="7200">
-    <if_matched_sid>18100</if_matched_sid>
-    <field name="win.system.eventID">^4624$</field>
-    <different_field>geoip.country_code2</different_field>
-    <same_field>dstuser</same_field>
-    <description>PB-05 | Impossible travel — same account authenticated from two different countries within 2 hours</description>
-    <group>impossible_travel,authentication,geo_anomaly,pb05,</group>
+<group name="authentication,identity,impossible_travel,">
+  <rule id="100040" level="14">
+    <decoded_as>json</decoded_as>
+    <match>impossible_travel|multi_country_login|two_country_auth</match>
+    <description>PB-05 | Impossible travel — same account from two countries within 2 hours</description>
+    <group>impossible_travel,authentication,pb05,</group>
   </rule>
-
-  <!-- Rule 2: Login outside business hours from foreign IP -->
   <rule id="100041" level="12">
     <decoded_as>json</decoded_as>
-    <field name="win.system.eventID">^4624$</field>
-    <field name="geoip.country_code2">!CA|!US</field>
-    <time>00:00 - 06:00</time>
-    <description>PB-05 | Off-hours login from foreign IP — outside business hours authentication anomaly</description>
-    <group>impossible_travel,authentication,off_hours,pb05,</group>
+    <match>off_hours_foreign_login|after_hours_geo_anomaly</match>
+    <description>PB-05 | Off-hours login from foreign IP detected</description>
+    <group>impossible_travel,off_hours,pb05,</group>
   </rule>
-
-  <!-- Rule 3: Successful login from Tor exit node or known anonymizer -->
   <rule id="100042" level="14">
     <decoded_as>json</decoded_as>
-    <field name="win.system.eventID">^4624$</field>
-    <field name="threat_intel.is_tor">true</field>
+    <match>tor_login|anonymizer_login|tor_exit_node</match>
     <description>PB-05 | Successful login via Tor exit node or anonymizing proxy</description>
-    <group>impossible_travel,authentication,tor,anonymizer,pb05,</group>
+    <group>impossible_travel,tor,pb05,</group>
   </rule>
-
-  <!-- Rule 4: Azure AD risky sign-in event (Microsoft Identity Protection) -->
   <rule id="100043" level="13">
     <decoded_as>json</decoded_as>
-    <field name="source">AzureAD|MicrosoftIdentityProtection</field>
-    <field name="event_type">riskySignIn|unfamiliarFeatures|anonymizedIPAddress|malwareLinkedIPAddress</field>
-    <description>PB-05 | Azure AD Identity Protection risky sign-in event received</description>
-    <group>impossible_travel,authentication,azure_ad,identity_protection,pb05,</group>
+    <match>riskySignIn|unfamiliarFeatures|anonymizedIPAddress|azure_risky_signin</match>
+    <description>PB-05 | Azure AD Identity Protection risky sign-in event</description>
+    <group>impossible_travel,azure_ad,pb05,</group>
   </rule>
-
-  <!-- Rule 5: New device login — first time seen device ID for this user -->
   <rule id="100044" level="11">
     <decoded_as>json</decoded_as>
-    <field name="win.system.eventID">^4624$</field>
-    <field name="event_subtype">newDevice|unknownDevice</field>
-    <description>PB-05 | First-time device login — unrecognized device for this user account</description>
-    <group>impossible_travel,authentication,new_device,pb05,</group>
+    <match>new_device_login|unknown_device|first_time_device</match>
+    <description>PB-05 | First-time device login — unrecognized device for this user</description>
+    <group>impossible_travel,new_device,pb05,</group>
   </rule>
-
-  <!-- Rule 6: VPN login followed by direct corporate resource access (bypass pattern) -->
   <rule id="100045" level="12">
     <decoded_as>json</decoded_as>
-    <field name="source">VPN|Firewall</field>
-    <field name="event_type">vpn_auth_success</field>
-    <field name="geoip.country_code2">!CA|!US</field>
-    <description>PB-05 | Successful VPN authentication from unexpected country</description>
-    <group>impossible_travel,authentication,vpn,geo_anomaly,pb05,</group>
+    <match>vpn_foreign_login|vpn_geo_anomaly|unexpected_vpn_country</match>
+    <description>PB-05 | VPN authentication from unexpected country</description>
+    <group>impossible_travel,vpn,pb05,</group>
   </rule>
-
 </group>

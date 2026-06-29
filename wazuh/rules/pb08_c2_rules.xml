@@ -1,66 +1,38 @@
-<group name="c2,beaconing,command_control,network,">
-
-  <!-- Rule 1: Periodic outbound connection — beaconing interval pattern -->
-  <rule id="100070" level="13" frequency="5" timeframe="300">
+<group name="c2,beaconing,command_control,">
+  <rule id="100070" level="13">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow|netflow|firewall_log</field>
-    <field name="direction">outbound</field>
-    <same_field>destination_ip</same_field>
-    <same_field>source_host</same_field>
-    <description>PB-08 | Beaconing detected — 5+ periodic outbound connections to same destination within 5 minutes</description>
-    <group>c2,beaconing,network,pb08,</group>
+    <match>beaconing_detected|periodic_outbound|c2_beacon_pattern</match>
+    <description>PB-08 | Beaconing detected — periodic outbound connections to same destination</description>
+    <group>c2,beaconing,pb08,</group>
   </rule>
-
-  <!-- Rule 2: Connection to known C2 framework default port -->
   <rule id="100071" level="14">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow|firewall_log</field>
-    <field name="destination_port">4444|8080|8443|9001|9090|1337|31337|50050|60000</field>
-    <field name="direction">outbound</field>
-    <description>PB-08 | Outbound connection to known C2 framework default port (Metasploit/Cobalt Strike/Empire)</description>
-    <group>c2,known_c2_port,network,pb08,</group>
+    <match>c2_port_4444|c2_port_8080|c2_port_9001|c2_port_50050|c2_port_31337</match>
+    <description>PB-08 | Outbound connection to known C2 framework default port</description>
+    <group>c2,known_c2_port,pb08,</group>
   </rule>
-
-  <!-- Rule 3: Cobalt Strike beacon jitter pattern — irregular intervals with consistent payload size -->
   <rule id="100072" level="15">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow</field>
-    <field name="bytes_sent">\b(4[0-9]{2}|5[0-9]{2})\b</field>
-    <field name="beacon_jitter">true</field>
-    <description>PB-08 | Cobalt Strike beacon pattern — consistent small payload with jitter interval</description>
-    <group>c2,cobalt_strike,beaconing,pb08,</group>
+    <match>cobalt_strike|cs_beacon|beacon_jitter|malleable_c2</match>
+    <description>PB-08 | Cobalt Strike beacon pattern detected</description>
+    <group>c2,cobalt_strike,pb08,</group>
   </rule>
-
-  <!-- Rule 4: HTTPS to non-standard port (encrypted C2 channel) -->
   <rule id="100073" level="12">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow|proxy_log</field>
-    <field name="protocol">HTTPS|TLS|SSL</field>
-    <field name="destination_port">^(?!443$)[0-9]+</field>
-    <field name="direction">outbound</field>
+    <match>https_nonstandard_port|encrypted_c2|tls_nonstandard</match>
     <description>PB-08 | HTTPS traffic on non-standard port — potential encrypted C2 channel</description>
-    <group>c2,encrypted_channel,network,pb08,</group>
+    <group>c2,encrypted_channel,pb08,</group>
   </rule>
-
-  <!-- Rule 5: Process making unexpected outbound connection (LOLBin C2) -->
   <rule id="100074" level="13">
-    <decoded_as>windows_eventchannel</decoded_as>
-    <field name="win.system.eventID">^5156$</field>
-    <field name="win.eventdata.application">powershell\.exe|cmd\.exe|wscript\.exe|mshta\.exe|regsvr32\.exe|rundll32\.exe|certutil\.exe|bitsadmin\.exe</field>
-    <field name="win.eventdata.direction">outbound</field>
-    <description>PB-08 | LOLBin process making unexpected outbound network connection (EventID 5156)</description>
-    <group>c2,lolbin,network,pb08,</group>
-  </rule>
-
-  <!-- Rule 6: High-frequency small packet outbound — data staging/exfil over C2 -->
-  <rule id="100075" level="13" frequency="100" timeframe="60">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow</field>
-    <field name="bytes_per_packet">\b([1-9][0-9]{1,2})\b</field>
-    <field name="direction">outbound</field>
-    <same_field>destination_ip</same_field>
-    <description>PB-08 | High-frequency small packet outbound — potential data staging or C2 keep-alive</description>
-    <group>c2,beaconing,data_staging,pb08,</group>
+    <match>lolbin_network|powershell_outbound|certutil_outbound|bitsadmin_outbound|rundll32_outbound</match>
+    <description>PB-08 | LOLBin process making unexpected outbound network connection</description>
+    <group>c2,lolbin,pb08,</group>
   </rule>
-
+  <rule id="100075" level="13">
+    <decoded_as>json</decoded_as>
+    <match>high_frequency_small_packet|data_staging_c2|c2_keepalive</match>
+    <description>PB-08 | High-frequency small packet outbound — potential C2 keep-alive</description>
+    <group>c2,beaconing,pb08,</group>
+  </rule>
 </group>

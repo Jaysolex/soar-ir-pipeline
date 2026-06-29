@@ -1,62 +1,38 @@
-<group name="data_exfiltration,dlp,network,insider_threat,">
-
-  <!-- Rule 1: Large outbound data transfer exceeding threshold -->
+<group name="data_exfiltration,dlp,">
   <rule id="100050" level="13">
     <decoded_as>json</decoded_as>
-    <field name="event_type">network_flow|netflow</field>
-    <field name="direction">outbound</field>
-    <field name="bytes_sent">\b([5-9][0-9]{7}|[1-9][0-9]{8,})\b</field>
-    <description>PB-06 | Large outbound transfer detected — 50MB+ sent to external destination</description>
-    <group>data_exfiltration,network,large_transfer,pb06,</group>
+    <match>large_outbound_transfer|bytes_sent_threshold|data_exfil_volume</match>
+    <description>PB-06 | Large outbound transfer detected — 50MB or more sent to external destination</description>
+    <group>data_exfiltration,large_transfer,pb06,</group>
   </rule>
-
-  <!-- Rule 2: Bulk file upload to cloud storage (non-approved) -->
   <rule id="100051" level="13">
     <decoded_as>json</decoded_as>
-    <field name="event_type">proxy_log|web_filter</field>
-    <field name="destination_domain">mega\.nz|wetransfer\.com|anonfiles\.com|gofile\.io|temp\.sh|file\.io|0x0\.st</field>
-    <description>PB-06 | Bulk upload to unapproved file sharing / anonymous upload service</description>
-    <group>data_exfiltration,cloud_upload,dlp,pb06,</group>
+    <match>mega\.nz|wetransfer\.com|anonfiles\.com|gofile\.io|temp\.sh</match>
+    <description>PB-06 | Bulk upload to unapproved file sharing service detected</description>
+    <group>data_exfiltration,cloud_upload,pb06,</group>
   </rule>
-
-  <!-- Rule 3: Sensitive file access spike — mass document open/copy -->
-  <rule id="100052" level="12" frequency="30" timeframe="300">
-    <if_matched_sid>554</if_matched_sid>
-    <field name="audit.type">READ|OPEN</field>
-    <field name="audit.file.name">\.docx$|\.xlsx$|\.pdf$|\.csv$|\.pptx$|\.sql$|\.bak$|\.db$</field>
-    <same_field>audit.effective_user</same_field>
-    <description>PB-06 | Mass document access — 30+ sensitive files opened by same user in 5 minutes</description>
-    <group>data_exfiltration,insider_threat,file_access,pb06,</group>
+  <rule id="100052" level="12">
+    <decoded_as>json</decoded_as>
+    <match>mass_document_access|bulk_file_read|sensitive_dir_access</match>
+    <description>PB-06 | Mass document access — bulk sensitive file reads detected</description>
+    <group>data_exfiltration,file_access,pb06,</group>
   </rule>
-
-  <!-- Rule 4: Email with large attachment sent to personal/external address -->
   <rule id="100053" level="13">
     <decoded_as>json</decoded_as>
-    <field name="event_type">email_dlp|mail_gateway</field>
-    <field name="recipient_domain">gmail\.com|yahoo\.com|hotmail\.com|protonmail\.com|outlook\.com</field>
-    <field name="attachment_size_bytes">\b([1-9][0-9]{6,})\b</field>
-    <description>PB-06 | Large attachment sent to personal email address — potential data exfiltration</description>
-    <group>data_exfiltration,email,dlp,pb06,</group>
+    <match>gmail\.com|yahoo\.com|protonmail\.com|personal_email_attachment</match>
+    <description>PB-06 | Large attachment sent to personal email address</description>
+    <group>data_exfiltration,email,pb06,</group>
   </rule>
-
-  <!-- Rule 5: USB mass storage device data copy (DLP agent) -->
   <rule id="100054" level="12">
     <decoded_as>json</decoded_as>
-    <field name="event_type">dlp_endpoint|usb_activity</field>
-    <field name="action">copy_to_removable|write_to_usb</field>
-    <field name="data_classification">Confidential|Restricted|PII|PHI|PCI</field>
-    <description>PB-06 | Classified data copied to USB removable storage device</description>
-    <group>data_exfiltration,usb,dlp,insider_threat,pb06,</group>
+    <match>usb_copy|removable_storage|dlp_usb_alert|classified_to_usb</match>
+    <description>PB-06 | Classified data copied to USB removable storage</description>
+    <group>data_exfiltration,usb,pb06,</group>
   </rule>
-
-  <!-- Rule 6: DNS over HTTPS or tunneling indicators -->
   <rule id="100055" level="14">
     <decoded_as>json</decoded_as>
-    <field name="event_type">dns_query|network_flow</field>
-    <field name="query_length">\b([6-9][0-9]|[1-9][0-9]{2,})\b</field>
-    <field name="query_type">TXT|NULL|CNAME</field>
-    <description>PB-06 | Anomalous DNS query — long TXT/NULL record, potential DNS tunneling exfiltration</description>
-    <group>data_exfiltration,dns_tunnel,network,pb06,</group>
+    <match>dns_tunnel|dns_exfil|long_dns_query|dns_txt_anomaly</match>
+    <description>PB-06 | Anomalous DNS query — potential DNS tunneling exfiltration</description>
+    <group>data_exfiltration,dns_tunnel,pb06,</group>
   </rule>
-
 </group>

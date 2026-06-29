@@ -1,64 +1,38 @@
-<group name="cloud,misconfiguration,aws,azure,compliance,">
-
-  <!-- Rule 1: S3 bucket made public -->
+<group name="cloud,misconfiguration,">
   <rule id="100090" level="14">
     <decoded_as>json</decoded_as>
-    <field name="source">AWS_CloudTrail|GuardDuty</field>
-    <field name="eventName">PutBucketAcl|PutBucketPolicy</field>
-    <field name="requestParameters.accessControlList.x-amz-grant-read">http://acs.amazonaws.com/groups/global/AllUsers</field>
-    <description>PB-10 | AWS S3 bucket ACL set to public — data exposure risk (CloudTrail)</description>
-    <group>cloud,misconfiguration,aws,s3,data_exposure,pb10,</group>
+    <match>s3_public_acl|bucket_made_public|PutBucketAcl.*AllUsers</match>
+    <description>PB-10 | AWS S3 bucket ACL set to public — data exposure risk</description>
+    <group>cloud,misconfiguration,aws,pb10,</group>
   </rule>
-
-  <!-- Rule 2: Security group opens 0.0.0.0/0 on sensitive ports -->
   <rule id="100091" level="13">
     <decoded_as>json</decoded_as>
-    <field name="source">AWS_CloudTrail</field>
-    <field name="eventName">AuthorizeSecurityGroupIngress</field>
-    <field name="requestParameters.cidrIp">0\.0\.0\.0/0|::/0</field>
-    <field name="requestParameters.fromPort">22|3389|1433|3306|5432|27017|6379</field>
-    <description>PB-10 | AWS security group opened to internet on sensitive port (SSH/RDP/DB) — inbound 0.0.0.0/0</description>
-    <group>cloud,misconfiguration,aws,security_group,network_exposure,pb10,</group>
+    <match>security_group_open|sg_0000_ingress|AuthorizeSecurityGroupIngress</match>
+    <description>PB-10 | AWS security group opened to internet on sensitive port</description>
+    <group>cloud,misconfiguration,aws,pb10,</group>
   </rule>
-
-  <!-- Rule 3: AWS root account used -->
   <rule id="100092" level="15">
     <decoded_as>json</decoded_as>
-    <field name="source">AWS_CloudTrail</field>
-    <field name="userIdentity.type">Root</field>
-    <field name="eventName">!CreateVirtualMFADevice|!EnableMFADevice|!GetAccountSummary|!ListMFADevices</field>
-    <description>PB-10 | AWS root account used for non-MFA operation — critical security violation</description>
-    <group>cloud,misconfiguration,aws,root_account,pb10,</group>
+    <match>aws_root_login|root_account_used|root_api_call</match>
+    <description>PB-10 | AWS root account used — critical security violation</description>
+    <group>cloud,misconfiguration,aws,pb10,</group>
   </rule>
-
-  <!-- Rule 4: Azure NSG rule opens RDP/SSH to internet -->
   <rule id="100093" level="13">
     <decoded_as>json</decoded_as>
-    <field name="source">AzureActivityLog|AzureDefender</field>
-    <field name="operationName">Microsoft.Network/networkSecurityGroups/securityRules/write</field>
-    <field name="properties.destinationPortRange">22|3389|*</field>
-    <field name="properties.sourceAddressPrefix">*|Internet|0.0.0.0/0</field>
-    <description>PB-10 | Azure NSG rule allowing RDP/SSH from internet — network exposure misconfiguration</description>
-    <group>cloud,misconfiguration,azure,nsg,network_exposure,pb10,</group>
+    <match>azure_nsg_open|nsg_rdp_internet|nsg_ssh_internet</match>
+    <description>PB-10 | Azure NSG rule allowing RDP or SSH from internet</description>
+    <group>cloud,misconfiguration,azure,pb10,</group>
   </rule>
-
-  <!-- Rule 5: GuardDuty high-severity finding -->
   <rule id="100094" level="14">
     <decoded_as>json</decoded_as>
-    <field name="source">AWS_GuardDuty</field>
-    <field name="severity">\b([7-9]\.[0-9]|10\.0)\b</field>
-    <description>PB-10 | AWS GuardDuty high-severity finding (7.0+) — active threat or critical misconfiguration detected</description>
-    <group>cloud,misconfiguration,aws,guardduty,pb10,</group>
+    <match>guardduty_high|guardduty_finding|aws_threat_detected</match>
+    <description>PB-10 | AWS GuardDuty high-severity finding detected</description>
+    <group>cloud,misconfiguration,aws,pb10,</group>
   </rule>
-
-  <!-- Rule 6: IAM privilege escalation — admin policy attached directly to user -->
   <rule id="100095" level="14">
     <decoded_as>json</decoded_as>
-    <field name="source">AWS_CloudTrail</field>
-    <field name="eventName">AttachUserPolicy|PutUserPolicy</field>
-    <field name="requestParameters.policyArn">AdministratorAccess|PowerUserAccess|IAMFullAccess</field>
-    <description>PB-10 | AWS IAM — administrator policy attached directly to user (violates least-privilege, no role boundary)</description>
-    <group>cloud,misconfiguration,aws,iam,privilege_escalation,pb10,</group>
+    <match>iam_admin_attached|AdministratorAccess_user|iam_privilege_escalation</match>
+    <description>PB-10 | AWS IAM administrator policy attached directly to user</description>
+    <group>cloud,misconfiguration,aws,pb10,</group>
   </rule>
-
 </group>
