@@ -26,6 +26,6 @@ echo ""
 echo "=== Status Check ==="
 docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "wazuh|shuffle|thehive|orborus"
 echo ""
-curl -k -s -o /dev/null -w "Shuffle: %{http_code}\n" https://192.168.238.132:3443
-curl -s -o /dev/null -w "TheHive: %{http_code}\n" http://192.168.238.132:9000
+curl -k -s -o /dev/null -w "Shuffle: %{http_code}\n" https://192.168.444.132:3443
+curl -s -o /dev/null -w "TheHive: %{http_code}\n" http://192.168.238.444:9000
 echo "=== Done: $(date) ==="
