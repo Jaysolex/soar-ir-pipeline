@@ -1,38 +1,51 @@
-<group name="ransomware,malware,endpoint,">
-  <rule id="100020" level="15">
-    <decoded_as>json</decoded_as>
-    <match>\.locked|\.encrypted|\.enc|\.crypt|\.wncry|\.cerber|\.locky</match>
-    <description>PB-03 | Ransomware — mass file extension rename detected</description>
-    <group>ransomware,file_encryption,pb03,</group>
+<group name="ransomware,malware,endpoint,pb03,">
+
+  <!-- Rule 1: Any Sysmon process creation — baseline -->
+  <rule id="100020" level="5">
+    <if_sid>61603</if_sid>
+    <description>PB-03 | Process creation event captured via Sysmon EventID 1</description>
+    <group>ransomware,process_creation,pb03,</group>
   </rule>
-  <rule id="100021" level="14">
-    <decoded_as>json</decoded_as>
-    <match>README_FOR_DECRYPT|HOW_TO_DECRYPT|DECRYPT_INSTRUCTIONS|YOUR_FILES_ARE_ENCRYPTED</match>
-    <description>PB-03 | Ransomware note file created on filesystem</description>
-    <group>ransomware,ransom_note,pb03,</group>
-  </rule>
-  <rule id="100022" level="15">
-    <decoded_as>json</decoded_as>
-    <match>vssadmin.*delete|shadowcopy.*delete|bcdedit.*recoveryenabled.*no</match>
-    <description>PB-03 | Volume shadow copy deletion — ransomware pre-encryption step</description>
+
+  <!-- Rule 2: VSS deletion command — vssadmin delete shadows -->
+  <rule id="100021" level="15">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine">vssadmin.*delete|vssadmin.*shadows|wmic.*shadowcopy.*delete</field>
+    <description>PB-03 | Volume shadow copy deletion command detected</description>
     <group>ransomware,shadow_copy,pb03,</group>
   </rule>
-  <rule id="100023" level="13">
-    <decoded_as>json</decoded_as>
-    <match>high_frequency_write|mass_file_write|encryption_in_progress</match>
-    <description>PB-03 | High-frequency file write activity detected</description>
-    <group>ransomware,file_activity,pb03,</group>
+
+  <!-- Rule 3: bcdedit recovery disable — common ransomware pre-encryption -->
+  <rule id="100022" level="15">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine">bcdedit.*recoveryenabled.*no|bcdedit.*bootstatuspolicy</field>
+    <description>PB-03 | Boot recovery disabled via bcdedit — ransomware pre-encryption pattern</description>
+    <group>ransomware,boot_recovery,pb03,</group>
   </rule>
-  <rule id="100024" level="15">
-    <decoded_as>json</decoded_as>
-    <match>wannacry|wcry|petya|notpetya|ryuk|conti|lockbit|blackcat|revil|sodinokibi</match>
-    <description>PB-03 | Known ransomware binary name detected</description>
+
+  <!-- Rule 4: Known ransomware binary names -->
+  <rule id="100023" level="15">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.image">wannacry|wcry|petya|notpetya|ryuk|conti|lockbit|blackcat|revil|sodinokibi</field>
+    <description>PB-03 | Known ransomware binary name detected in process creation</description>
     <group>ransomware,known_malware,pb03,</group>
   </rule>
-  <rule id="100025" level="12">
-    <decoded_as>json</decoded_as>
-    <match>network_share_access|smb_enumeration|lateral_spread</match>
-    <description>PB-03 | Network share enumeration — potential ransomware lateral spread</description>
-    <group>ransomware,lateral_movement,pb03,</group>
+
+  <!-- Rule 5: Mass file rename pattern via Sysmon file create (EventID 11) -->
+  <rule id="100024" level="13">
+    <if_sid>61600</if_sid>
+    <field name="win.system.eventID">^11$</field>
+    <field name="win.eventdata.targetFilename">\.locked$|\.encrypted$|\.enc$|\.crypt$|\.wncry$|\.cerber$</field>
+    <description>PB-03 | Ransomware file extension detected — encrypted file created</description>
+    <group>ransomware,file_encryption,pb03,</group>
   </rule>
+
+  <!-- Rule 6: wbadmin delete backup — another ransomware pattern -->
+  <rule id="100025" level="14">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine">wbadmin.*delete.*backup|wbadmin.*delete.*catalog</field>
+    <description>PB-03 | Backup deletion via wbadmin detected — ransomware pre-encryption step</description>
+    <group>ransomware,backup_deletion,pb03,</group>
+  </rule>
+
 </group>

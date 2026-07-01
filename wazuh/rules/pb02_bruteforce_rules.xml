@@ -1,48 +1,60 @@
 <group name="authentication,brute_force,pb02,">
 
-  <!-- Rule 1: Single failed logon (baseline, low severity) -->
   <rule id="100010" level="5">
     <if_sid>60122</if_sid>
     <description>PB-02 | Failed logon attempt detected (Windows EventID 4625)</description>
     <group>brute_force,authentication,pb02,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
-  <!-- Rule 2: Brute force - 5+ failed logons from same agent within 60s -->
   <rule id="100011" level="10" frequency="5" timeframe="60">
     <if_matched_sid>100010</if_matched_sid>
     <description>PB-02 | Brute force detected - 5+ failed logon attempts within 60 seconds</description>
     <group>brute_force,authentication,pb02,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
-  <!-- Rule 3: Aggressive brute force - 10+ failed logons within 60s -->
   <rule id="100012" level="12" frequency="10" timeframe="60">
     <if_matched_sid>100010</if_matched_sid>
     <description>PB-02 | Aggressive brute force - 10+ failed logon attempts within 60 seconds</description>
     <group>brute_force,authentication,pb02,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
-  <!-- Rule 4: Account lockout triggered (Windows EventID 4740) -->
   <rule id="100013" level="10">
     <if_sid>60106</if_sid>
     <field name="win.system.eventID">^4740$</field>
     <description>PB-02 | Windows account lockout triggered (EventID 4740)</description>
     <group>brute_force,account_lockout,pb02,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
-  <!-- Rule 5: Successful logon immediately after failed attempts (credential stuffing pattern) -->
   <rule id="100014" level="14">
     <if_matched_sid>100011</if_matched_sid>
     <field name="win.system.eventID">^4624$</field>
-    <description>PB-02 | Credential stuffing suspected - successful logon after brute force pattern</description>
+    <description>PB-02 | Credential stuffing suspected - successful logon after brute force</description>
     <group>brute_force,credential_stuffing,pb02,</group>
+    <mitre>
+      <id>T1110.004</id>
+    </mitre>
   </rule>
 
-  <!-- Rule 6: Privileged account brute force (administrator targeted) -->
   <rule id="100015" level="13" frequency="3" timeframe="60">
     <if_matched_sid>100010</if_matched_sid>
     <field name="win.eventdata.targetUserName">administrator|Administrator|admin</field>
-    <description>PB-02 | Privileged account brute force - administrator account targeted</description>
+    <description>PB-02 | Privileged account brute force - administrator targeted</description>
     <group>brute_force,privileged_account,pb02,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
 </group>
